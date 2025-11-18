@@ -1,0 +1,111 @@
+#############################################
+# PYTHON
+#############################################
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Caches
+.cache/
+pytest_cache/
+.ipynb_checkpoints/
+
+#############################################
+# ENVIRONMENT / SECRETS
+#############################################
+
+# Do NOT commit secrets
+.env
+*.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+credentials.json
+serviceAccount.json
+
+# Your example env is allowed
+!.env.example
+
+#############################################
+# AZURE-SPECIFIC
+#############################################
+
+# Azure credentials created locally
+.azure/
+*.azureconfig
+*.azureauth
+
+# Cosmos DB emulator
+cosmosdb_emulator/
+
+#############################################
+# LOGS / DATA / TEMP FILES
+#############################################
+
+*.log
+*.db
+*.sqlite3
+tmp/
+temp/
+
+#############################################
+# EDITORS / IDE FILES
+#############################################
+
+# VS Code
+.vscode/
+
+# PyCharm / IntelliJ
+.idea/
+
+#############################################
+# DOCKER
+#############################################
+
+# Ignore local Docker artifacts
+*.pid
+*.tar
+docker-data/
+
+#############################################
+# OS GENERATED FILES
+#############################################
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+#############################################
+# NODE (if Postman or frontend assets exist)
+#############################################
+
+node_modules/
+
+#############################################
+# MISC
+#############################################
+
+# Ignore compiled translations
+*.mo
+
+# Ignore coverage reports
+.coverage
+htmlcov/
