@@ -54,36 +54,55 @@ async def root():
 
 @app.post("/api/job-description", response_model=JobDescriptionResponse)
 async def upload_job_description(
-    job_description_file: UploadFile = File(...),
+    screening_name: str = Form(...),
     must_have_skills: str = Form(...),
-    nice_to_have_skills: str = Form(...)
+    nice_to_have_skills: str = Form(...),
+    job_description_file: UploadFile = File(None),
+    description: str = Form(None)
 ):
     """
     Upload job description and skills
     
     Args:
-        job_description_file: PDF or Word document containing job description
+        screening_name: Name/title for this screening (e.g., "Senior Python Developer - Q4 2024")
+        job_description_file: Optional single PDF or Word document containing job description
+        description: Optional manual text entry for job description (used if file not uploaded)
         must_have_skills: JSON array of skill strings ["Python", "FastAPI", ...]
         nice_to_have_skills: JSON array of skill strings ["Docker", "Kubernetes", ...]
+    
+    Note: Either job_description_file OR description must be provided
     
     Returns:
         JobDescriptionResponse with job_id and uploaded file details
     """
     try:
-        # Validate file type (case-insensitive)
-        if not job_description_file.filename.lower().endswith(('.pdf', '.docx', '.doc')):
+        # Validate that at least one of file or description is provided
+        if not job_description_file and not description:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid file format. Only PDF and Word documents are supported."
+                detail="Either job_description_file or description text must be provided."
             )
         
-        # Parse skills from JSON (now expecting simple string arrays)
+        if job_description_file and description:
+            raise HTTPException(
+                status_code=400,
+                detail="Please provide either job_description_file OR description text, not both."
+            )
+        
+        # Validate file type if file is provided
+        if job_description_file and job_description_file.filename:
+            if not job_description_file.filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid file format. Only PDF and Word documents are supported."
+                )
+        
+        # Parse skills from JSON
         try:
             must_have_skills_list = json.loads(must_have_skills)
             nice_to_have_skills_list = json.loads(nice_to_have_skills)
             
             # Convert simple strings to skill objects with default weights
-            # Must-have skills get weight 8, Nice-to-have skills get weight 5
             must_have_skills_objects = [
                 {"skill": skill, "weight": 8} for skill in must_have_skills_list
             ]
@@ -96,40 +115,61 @@ async def upload_job_description(
                 detail="Invalid JSON format for skills. Expected: [\"skill1\", \"skill2\"]"
             )
         
-        # Upload job description to blob storage
-        file_content = await job_description_file.read()
-        blob_url = await blob_service.upload_file(
-            file_content,
-            f"job-descriptions/{datetime.utcnow().timestamp()}_{job_description_file.filename}",
-            content_type=job_description_file.content_type
-        )
+        blob_url = None
+        filename = None
+        job_description_text = None
         
-        # Parse job description text
-        job_description_text = await document_parser.parse_document(
-            file_content,
-            job_description_file.filename
-        )
-        
-        # Create job entry in CosmosDB
-        job_id = await cosmos_service.create_job_description(
-            job_description_text=job_description_text,
-            blob_url=blob_url,
-            must_have_skills=must_have_skills_objects,
-            nice_to_have_skills=nice_to_have_skills_objects,
-            filename=job_description_file.filename
-        )
+        # Process file upload if provided
+        if job_description_file and job_description_file.filename:
+            file_content = await job_description_file.read()
+            blob_url = await blob_service.upload_file(
+                file_content,
+                f"job-descriptions/{datetime.utcnow().timestamp()}_{job_description_file.filename}",
+                content_type=job_description_file.content_type
+            )
+            filename = job_description_file.filename
+            
+            # Parse job description text from file
+            job_description_text = await document_parser.parse_document(
+                file_content,
+                job_description_file.filename
+            )
+            
+            # Create job entry with blob_url
+            job_id = await cosmos_service.create_job_description(
+                screening_name=screening_name,
+                job_description_text=job_description_text,
+                must_have_skills=must_have_skills_objects,
+                nice_to_have_skills=nice_to_have_skills_objects,
+                blob_url=blob_url,
+                filename=filename
+            )
+        else:
+            # Use manual description text
+            job_description_text = description
+            filename = "Manual Entry"
+            
+            # Create job entry without blob_url
+            job_id = await cosmos_service.create_job_description(
+                screening_name=screening_name,
+                job_description_text=job_description_text,
+                must_have_skills=must_have_skills_objects,
+                nice_to_have_skills=nice_to_have_skills_objects,
+                filename=filename
+            )
         
         return JobDescriptionResponse(
             job_id=job_id,
             message="Job description uploaded successfully",
-            blob_url=blob_url,
+            blob_url=blob_url if blob_url else "Manual entry - no file uploaded",
             must_have_skills_count=len(must_have_skills_list),
             nice_to_have_skills_count=len(nice_to_have_skills_list)
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/screen-resumes", response_model=ResumeScreeningResponse)
 async def screen_resumes(
@@ -255,13 +295,13 @@ async def screen_resumes(
 @app.get("/api/jobs")
 async def get_all_jobs():
     """
-    Retrieve all job descriptions with summary information
+    Retrieve all job descriptions with summary information and screening counts
     
     Returns:
-        List of all jobs with screening statistics
+        List of all jobs with total screenings and candidate counts
     """
     try:
-        jobs = await cosmos_service.get_all_jobs()
+        jobs = await cosmos_service.get_all_jobs_with_counts()
         
         if not jobs:
             return {
@@ -276,7 +316,6 @@ async def get_all_jobs():
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/api/job/{job_id}")
 async def get_job_details(job_id: str):

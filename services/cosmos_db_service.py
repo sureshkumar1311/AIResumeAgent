@@ -51,21 +51,23 @@ class CosmosDBService:
     
     async def create_job_description(
         self,
+        screening_name: str,
         job_description_text: str,
-        blob_url: str,
         must_have_skills: List[Dict],
         nice_to_have_skills: List[Dict],
-        filename: str
+        filename: Optional[str] = None,
+        blob_url: Optional[str] = None
     ) -> str:
         """
         Create a new job description entry
         
         Args:
-            job_description_text: Extracted job description text
-            blob_url: Azure Blob URL for the job description file
+            screening_name: Name/title for this screening
+            job_description_text: Extracted or manual job description text
             must_have_skills: List of must-have skills
             nice_to_have_skills: List of nice-to-have skills
-            filename: Original filename
+            filename: Optional original filename or "Manual Entry"
+            blob_url: Optional Azure Blob URL for the job description file (only when file uploaded)
         
         Returns:
             Job ID
@@ -76,15 +78,20 @@ class CosmosDBService:
             job_data = {
                 "id": job_id,
                 "job_id": job_id,
+                "screening_name": screening_name,
                 "job_description_text": job_description_text,
-                "blob_url": blob_url,
-                "filename": filename,
+                "filename": filename if filename else "Manual Entry",
                 "must_have_skills": must_have_skills,
                 "nice_to_have_skills": nice_to_have_skills,
                 "created_at": datetime.utcnow().isoformat(),
                 "total_screenings": 0,
+                "total_candidates": 0,
                 "status": "active"
             }
+            
+            # Add blob_url only if it exists (when file is uploaded)
+            if blob_url:
+                job_data["blob_url"] = blob_url
             
             self.jobs_container.create_item(body=job_data)
             return job_id
@@ -125,6 +132,7 @@ class CosmosDBService:
             job_data = await self.get_job_description(job_id)
             if job_data:
                 job_data["total_screenings"] = job_data.get("total_screenings", 0) + 1
+                job_data["total_candidates"] = job_data.get("total_candidates", 0) + 1
                 job_data["last_screening_at"] = datetime.utcnow().isoformat()
                 self.jobs_container.upsert_item(body=job_data)
         
@@ -367,6 +375,53 @@ class CosmosDBService:
         except Exception as e:
             print(f"Failed to delete job and screenings: {str(e)}")
             return False
+        
+    async def get_all_jobs_with_counts(self) -> List[Dict[str, Any]]:
+        """
+        Get all job descriptions with screening and candidate counts
+        
+        Returns:
+            List of all jobs with counts
+        """
+        try:
+            query = "SELECT * FROM c ORDER BY c.created_at DESC"
+            
+            items = list(self.jobs_container.query_items(
+                query=query,
+                enable_cross_partition_query=True
+            ))
+            
+            # Enrich each job with screening counts
+            for job in items:
+                job_id = job.get("job_id")
+                
+                # Get count of screenings for this job
+                screening_count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.job_id = @job_id"
+                screening_count_params = [{"name": "@job_id", "value": job_id}]
+                
+                try:
+                    count_result = list(self.screenings_container.query_items(
+                        query=screening_count_query,
+                        parameters=screening_count_params,
+                        enable_cross_partition_query=False,
+                        partition_key=job_id
+                    ))
+                    
+                    actual_count = count_result[0] if count_result else 0
+                    
+                    # Update job with actual counts
+                    job["total_screenings"] = actual_count
+                    job["total_candidates"] = actual_count
+                    
+                except Exception as e:
+                    print(f"Error getting count for job {job_id}: {str(e)}")
+                    job["total_screenings"] = job.get("total_screenings", 0)
+                    job["total_candidates"] = job.get("total_candidates", 0)
+            
+            return items
+        
+        except Exception as e:
+            raise Exception(f"Failed to retrieve all jobs with counts: {str(e)}")
     
     async def get_statistics(self, job_id: str) -> Dict[str, Any]:
         """
