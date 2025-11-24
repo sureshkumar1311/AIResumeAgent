@@ -234,6 +234,67 @@ class CosmosDBService:
         except Exception as e:
             raise Exception(f"Failed to retrieve screening result: {str(e)}")
     
+    async def get_screening_by_screening_id(
+        self,
+        screening_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get screening result by screening_id (cross-partition query)
+        
+        Args:
+            screening_id: Screening ID
+        
+        Returns:
+            Screening result or None
+        """
+        try:
+            query = "SELECT * FROM c WHERE c.screening_id = @screening_id OR c.id = @screening_id"
+            parameters = [{"name": "@screening_id", "value": screening_id}]
+            
+            items = list(self.screenings_container.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            ))
+            
+            if items:
+                return items[0]
+            return None
+        
+        except Exception as e:
+            raise Exception(f"Failed to retrieve screening by screening_id: {str(e)}")
+    
+    async def get_screening_by_screening_id(
+        self,
+        screening_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get screening result by screening_id alone (cross-partition query)
+        
+        Args:
+            screening_id: Screening ID (the "id" field)
+        
+        Returns:
+            Screening result or None
+        """
+        try:
+            query = "SELECT * FROM c WHERE c.screening_id = @screening_id"
+            
+            parameters = [{"name": "@screening_id", "value": screening_id}]
+            
+            items = list(self.screenings_container.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            ))
+            
+            if items:
+                return items[0]
+            return None
+        
+        except Exception as e:
+            raise Exception(f"Failed to retrieve screening by ID: {str(e)}")
+    
     async def get_top_candidates(
         self,
         job_id: str,
@@ -343,3 +404,23 @@ class CosmosDBService:
         
         except Exception as e:
             raise Exception(f"Failed to calculate statistics: {str(e)}")
+    
+    async def get_all_jobs(self) -> List[Dict[str, Any]]:
+        """
+        Get all job descriptions with summary information
+        
+        Returns:
+            List of all jobs
+        """
+        try:
+            query = "SELECT * FROM c ORDER BY c.created_at DESC"
+            
+            items = list(self.jobs_container.query_items(
+                query=query,
+                enable_cross_partition_query=True
+            ))
+            
+            return items
+        
+        except Exception as e:
+            raise Exception(f"Failed to retrieve all jobs: {str(e)}")

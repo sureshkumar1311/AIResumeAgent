@@ -70,8 +70,8 @@ async def upload_job_description(
         JobDescriptionResponse with job_id and uploaded file details
     """
     try:
-        # Validate file type
-        if not job_description_file.filename.endswith(('.pdf', '.docx', '.doc')):
+        # Validate file type (case-insensitive)
+        if not job_description_file.filename.lower().endswith(('.pdf', '.docx', '.doc')):
             raise HTTPException(
                 status_code=400,
                 detail="Invalid file format. Only PDF and Word documents are supported."
@@ -155,7 +155,7 @@ async def screen_resumes(
         
         # Validate file types
         for resume in resumes:
-            if not resume.filename.endswith(('.pdf', '.docx', '.doc')):
+            if not resume.filename.lower().endswith(('.pdf', '.docx', '.doc')):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid file format for {resume.filename}. Only PDF and Word documents are supported."
@@ -252,31 +252,94 @@ async def screen_resumes(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/api/screening-result/{job_id}")
-async def get_screening_results(job_id: str):
+@app.get("/api/jobs")
+async def get_all_jobs():
     """
-    Retrieve all screening results for a job
-    
-    Args:
-        job_id: ID of the job description
+    Retrieve all job descriptions with summary information
     
     Returns:
-        All screening results for the job
+        List of all jobs with screening statistics
     """
     try:
-        results = await cosmos_service.get_screening_results(job_id)
-        if not results:
-            raise HTTPException(
-                status_code=404,
-                detail="No screening results found for this job"
-            )
+        jobs = await cosmos_service.get_all_jobs()
+        
+        if not jobs:
+            return {
+                "total_jobs": 0,
+                "jobs": []
+            }
         
         return {
-            "job_id": job_id,
-            "total_candidates": len(results),
-            "results": results
+            "total_jobs": len(jobs),
+            "jobs": jobs
         }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/job/{job_id}")
+async def get_job_details(job_id: str):
+    """
+    Get complete job description details with all candidate screening reports
+    
+    Args:
+        job_id: ID of the job (e.g., "8a17e2ae-fbf6-452f-8d72-03a54b3afe4a")
+    
+    Returns:
+        Complete job description item with all screening results for that job
+    
+    Example:
+        GET /api/job/8a17e2ae-fbf6-452f-8d72-03a54b3afe4a
+    """
+    try:
+        # Get job details
+        job_data = await cosmos_service.get_job_description(job_id)
+        if not job_data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Job not found with ID: {job_id}"
+            )
+        
+        # Get all screening results for this job
+        screening_results = await cosmos_service.get_screening_results(job_id)
+        
+        # Add screening results to response
+        job_data["screening_results"] = screening_results
+        job_data["total_candidates_screened"] = len(screening_results)
+        
+        return job_data
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/candidate/{candidate_id}")
+async def get_candidate_report(candidate_id: str, job_id: str):
+    """
+    Get candidate screening report by candidate_id
+    
+    Args:
+        candidate_id: ID of the candidate screening (the "id" field from screening results)
+        job_id: Job ID (required as query parameter for partition key)
+    
+    Returns:
+        Complete candidate screening report
+    
+    Example:
+        GET /api/candidate/752e07d3-9f58-444d-bf90-fcac32acf669?job_id=8a17e2ae-fbf6-452f-8d72-03a54b3afe4a
+    """
+    try:
+        result = await cosmos_service.get_screening_by_id(candidate_id, job_id)
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Candidate report not found with ID: {candidate_id}"
+            )
+        
+        return result
     
     except HTTPException:
         raise
