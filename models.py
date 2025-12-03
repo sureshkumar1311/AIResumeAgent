@@ -2,10 +2,51 @@
 Pydantic models for API request and response validation
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Union
 from datetime import datetime
 
+
+# ==================== USER AUTHENTICATION MODELS ====================
+
+class UserRegister(BaseModel):
+    """User registration request"""
+    email: EmailStr = Field(..., description="User email address")
+    password: str = Field(
+        ..., 
+        min_length=8, 
+        max_length=72,  # Add max length for bcrypt compatibility
+        description="Password (8-72 characters)"
+    )
+    full_name: str = Field(..., min_length=2, description="Full name")
+    company_name: Optional[str] = Field(None, description="Company name (optional)")
+
+class UserLogin(BaseModel):
+    """User login request"""
+    email: EmailStr = Field(..., description="User email address")
+    password: str = Field(..., description="Password")
+
+
+class UserResponse(BaseModel):
+    """User response (without password)"""
+    user_id: str
+    email: str
+    full_name: str
+    company_name: Optional[str] = None
+    created_at: str
+    is_active: bool
+    total_jobs: int = 0
+    total_screenings: int = 0
+
+
+class LoginResponse(BaseModel):
+    """Login response with JWT token"""
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+# ==================== JOB DESCRIPTION MODELS ====================
 
 class JobDescriptionResponse(BaseModel):
     """Job description upload response"""
@@ -14,6 +55,22 @@ class JobDescriptionResponse(BaseModel):
     blob_url: str = Field(..., description="Azure Blob Storage URL for job description")
     must_have_skills_count: int
     nice_to_have_skills_count: int
+
+class JobListingRequest(BaseModel):
+    """Request model for job listing with filters"""
+    search: Optional[str] = Field(None, description="Search by screening name or job description")
+    pageNumber: int = Field(1, ge=1, description="Page number (starts from 1)")
+    pageSize: int = Field(10, ge=1, le=100, description="Number of records per page")
+    sortBy: Optional[str] = Field("all", description="Filter by time: 'week', 'month', or 'all'")
+
+
+class JobListingResponse(BaseModel):
+    """Response model for job listing"""
+    total_jobs: int = Field(..., description="Total number of jobs matching filters")
+    total_pages: int = Field(..., description="Total number of pages")
+    current_page: int = Field(..., description="Current page number")
+    page_size: int = Field(..., description="Number of records per page")
+    jobs: List[Dict] = Field(..., description="List of jobs for current page")
 
 
 class FitScore(BaseModel):

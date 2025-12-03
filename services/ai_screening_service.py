@@ -1,6 +1,6 @@
 """
 AI Screening Service using Azure OpenAI
-Performs intelligent resume screening and analysis
+Performs intelligent resume screening and analysis with CONSISTENT results
 """
 
 from openai import AzureOpenAI
@@ -11,7 +11,7 @@ from typing import List, Dict, Any
 
 
 class AIScreeningService:
-    """Service for AI-powered resume screening"""
+    """Service for AI-powered resume screening with deterministic results"""
     
     def __init__(self):
         """Initialize Azure OpenAI client"""
@@ -120,7 +120,7 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert resume parser. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
+                temperature=0,  # Zero temperature for consistency
                 max_tokens=800
             )
             
@@ -155,9 +155,17 @@ class AIScreeningService:
         
         prompt = f"""
         Analyze this resume and determine which skills from the given lists are present.
-        For each skill found, also estimate:
-        - Proficiency level (Beginner/Intermediate/Advanced/Expert)
-        - Years of experience (estimate like "2-3 years" or "5+ years")
+        
+        IMPORTANT INSTRUCTIONS FOR CONSISTENT RESULTS:
+        1. Mark a skill as "found": true ONLY if there is CLEAR evidence in the resume
+        2. Consider variations and related technologies (e.g., "React.js" matches "React", "Python3" matches "Python")
+        3. Look for the skill in work experience, projects, skills sections, or certifications
+        4. Be consistent: if a skill is explicitly mentioned or clearly demonstrated, mark it as found
+        5. For proficiency and years: base on actual project duration and role complexity, not assumptions
+        
+        For each skill found, estimate:
+        - Proficiency level: Beginner (0-1 years), Intermediate (1-3 years), Advanced (3-5 years), Expert (5+ years)
+        - Years of experience: based on duration mentioned in projects/roles using that skill
         
         Resume (complete content):
         {resume_text}
@@ -171,25 +179,25 @@ class AIScreeningService:
                 {{
                     "skill": "skill name",
                     "found": true/false,
-                    "proficiency_level": "level",
-                    "years_of_experience": "estimate"
+                    "proficiency_level": "Beginner/Intermediate/Advanced/Expert",
+                    "years_of_experience": "0-1 years" or "2-3 years" etc
                 }}
             ],
             "nice_to_have_matched": [same structure]
         }}
         
-        Return ONLY valid JSON.
+        Return ONLY valid JSON. Be thorough and consistent in your analysis.
         """
         
         try:
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert technical recruiter analyzing resumes. Return only valid JSON."},
+                    {"role": "system", "content": "You are an expert technical recruiter analyzing resumes. Return only valid JSON. Be consistent and thorough."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
-                max_tokens=3000
+                temperature=0,  # Zero temperature for consistency
+                max_tokens=4000
             )
             
             content = response.choices[0].message.content.strip()
@@ -288,13 +296,28 @@ class AIScreeningService:
         # Get AI assessment of overall fit (30% weight) - uses full content
         prompt = f"""
         Rate how well this candidate matches the job requirements on a scale of 0-100.
-        Consider: relevant experience, job responsibilities match, career progression, industry fit.
+        
+        SCORING GUIDELINES FOR CONSISTENCY:
+        - 80-100: Exceptional match - exceeds most requirements, relevant experience, clear expertise
+        - 60-79: Good match - meets most requirements, relevant experience
+        - 40-59: Moderate match - meets some requirements, some relevant experience
+        - 20-39: Weak match - meets few requirements, limited relevant experience  
+        - 0-19: Poor match - minimal alignment with requirements
+        
+        Consider these factors:
+        1. Years of relevant experience match job requirements
+        2. Job responsibilities align with job description
+        3. Career progression shows growth in relevant areas
+        4. Industry experience is relevant
+        5. Education and certifications align
         
         Job Description (complete):
         {job_description}
         
         Resume (complete):
         {resume_text}
+        
+        Be objective and consistent. Base your score on actual evidence in the resume.
         
         Return ONLY a JSON object: {{"ai_fit_score": score_number, "reasoning": "brief reason"}}
         """
@@ -303,10 +326,10 @@ class AIScreeningService:
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert recruiter. Return only valid JSON."},
+                    {"role": "system", "content": "You are an expert recruiter who provides consistent, objective assessments. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
+                temperature=0,  # Zero temperature for consistency
                 max_tokens=500
             )
             
@@ -337,7 +360,9 @@ class AIScreeningService:
         
         prompt = f"""
         Create 3-4 concise bullet points summarizing this candidate's strengths and fit for the role.
-        Focus on: key skills, experience relevance, communication style, problem-solving abilities.
+        Focus on: key skills, experience relevance, notable achievements, and areas of expertise.
+        
+        Be objective and base your summary on concrete evidence from the resume.
         
         Job Requirements (complete):
         {job_description}
@@ -346,17 +371,17 @@ class AIScreeningService:
         {resume_text}
         
         Return ONLY a JSON array of strings: ["point 1", "point 2", "point 3", "point 4"]
-        Each point should be 1-2 sentences.
+        Each point should be 1-2 sentences and focus on factual information from the resume.
         """
         
         try:
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert recruiter providing candidate summaries. Return only valid JSON array."},
+                    {"role": "system", "content": "You are an expert recruiter providing objective candidate summaries. Return only valid JSON array."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.5,
+                temperature=0.1,  # Very low temperature for consistency while maintaining some fluency
                 max_tokens=800
             )
             
@@ -390,7 +415,14 @@ class AIScreeningService:
         
         prompt = f"""
         For each skill, estimate the candidate's proficiency percentage (0-100) based on their resume.
-        Consider: years of experience, project complexity, leadership/mentorship, certifications.
+        
+        PROFICIENCY SCORING GUIDELINES (be consistent):
+        - 0-25%: Beginner - mentioned briefly, minimal experience
+        - 26-50%: Intermediate - used in 1-2 projects, 1-2 years experience
+        - 51-75%: Advanced - used extensively, 3-5 years, led projects
+        - 76-100%: Expert - deep expertise, 5+ years, mentored others, complex projects
+        
+        Consider: years of experience, project complexity, leadership roles, certifications, depth of usage.
         
         Skills to analyze: {', '.join(skills_list)}
         
@@ -399,7 +431,7 @@ class AIScreeningService:
         
         Return ONLY a JSON array:
         [
-            {{"skill_name": "skill", "proficiency_percentage": number, "evidence": "brief evidence"}},
+            {{"skill_name": "skill", "proficiency_percentage": number, "evidence": "brief evidence from resume"}},
             ...
         ]
         """
@@ -408,11 +440,11 @@ class AIScreeningService:
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert at assessing technical skills. Return only valid JSON."},
+                    {"role": "system", "content": "You are an expert at assessing technical skills objectively. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
-                max_tokens=1500
+                temperature=0,  # Zero temperature for consistency
+                max_tokens=3000
             )
             
             content = response.choices[0].message.content.strip()
@@ -463,7 +495,7 @@ class AIScreeningService:
             "total_companies": number
         }}
         
-        For career_gap, return null if no significant gap found.
+        For career_gap, return null if no significant gap (>6 months) found.
         Industry percentages should sum to 100.
         """
         
@@ -474,7 +506,7 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert at analyzing career histories. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
+                temperature=0,  # Zero temperature for consistency
                 max_tokens=1500
             )
             
@@ -530,7 +562,7 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert at analyzing companies. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
+                temperature=0,  # Zero temperature for consistency
                 max_tokens=400
             )
             

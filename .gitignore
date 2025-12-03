@@ -109,3 +109,5 @@ node_modules/
 # Ignore coverage reports
 .coverage
 htmlcov/
+
+zip.zip

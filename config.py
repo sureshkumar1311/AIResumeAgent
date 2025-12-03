@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     COSMOS_DB_DATABASE_NAME: str = "resume-screening"
     COSMOS_DB_CONTAINER_JOBS: str = "jobs"
     COSMOS_DB_CONTAINER_SCREENINGS: str = "screenings"
+    COSMOS_DB_CONTAINER_USERS: str = "users"
+    
+    # JWT Authentication Configuration
+    JWT_SECRET_KEY: str = "your-secret-key-change-this-in-production-use-env-variable"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
     
     # Application Settings
     MAX_FILE_SIZE_MB: int = 10
@@ -34,6 +40,7 @@ class Settings(BaseSettings):
     # AI Processing Settings
     MIN_FIT_SCORE_FOR_INTERVIEW: int = 60
     TOP_SKILLS_FOR_DEPTH_ANALYSIS: int = 6
+    MAX_RESUMES_PER_BATCH: int = 50
     
     class Config:
         env_file = ".env"
