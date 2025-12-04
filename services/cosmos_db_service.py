@@ -619,3 +619,85 @@ class CosmosDBService:
         except Exception as e:
             print(f"Failed to delete job and screenings: {str(e)}")
             return False
+        
+    # Add this method to the CosmosDBService class
+
+    async def get_user_statistics(self, user_id: str) -> Dict[str, Any]:
+        """
+        Get comprehensive statistics for a user
+        
+        Args:
+            user_id: User ID
+        
+        Returns:
+            Dictionary with user statistics
+        """
+        try:
+            # Get all jobs for user
+            jobs_query = "SELECT * FROM c WHERE c.user_id = @user_id"
+            jobs_params = [{"name": "@user_id", "value": user_id}]
+            
+            jobs = list(self.jobs_container.query_items(
+                query=jobs_query,
+                parameters=jobs_params,
+                enable_cross_partition_query=False,
+                partition_key=user_id
+            ))
+            
+            total_job_descriptions = len(jobs)
+            total_resumes_screened = 0
+            jobs_with_screenings = 0
+            jobs_summary = []
+            
+            # Get screening counts for each job
+            for job in jobs:
+                job_id = job.get("job_id")
+                
+                # Get count of screenings for this job
+                screening_count_query = "SELECT VALUE COUNT(1) FROM c WHERE c.job_id = @job_id"
+                screening_count_params = [{"name": "@job_id", "value": job_id}]
+                
+                try:
+                    count_result = list(self.screenings_container.query_items(
+                        query=screening_count_query,
+                        parameters=screening_count_params,
+                        enable_cross_partition_query=False,
+                        partition_key=job_id
+                    ))
+                    
+                    screening_count = count_result[0] if count_result else 0
+                    total_resumes_screened += screening_count
+                    
+                    if screening_count > 0:
+                        jobs_with_screenings += 1
+                    
+                    jobs_summary.append({
+                        "job_id": job_id,
+                        "screening_name": job.get("screening_name"),
+                        "created_at": job.get("created_at"),
+                        "total_screenings": screening_count,
+                        "must_have_skills": job.get("must_have_skills", []),
+                        "nice_to_have_skills": job.get("nice_to_have_skills", [])
+                    })
+                    
+                except Exception as e:
+                    print(f"Error getting screenings for job {job_id}: {str(e)}")
+                    jobs_summary.append({
+                        "job_id": job_id,
+                        "screening_name": job.get("screening_name"),
+                        "created_at": job.get("created_at"),
+                        "total_screenings": 0,
+                        "must_have_skills": job.get("must_have_skills", []),
+                        "nice_to_have_skills": job.get("nice_to_have_skills", [])
+                    })
+            
+            return {
+                "user_id": user_id,
+                "total_job_descriptions": total_job_descriptions,
+                "total_resumes_screened": total_resumes_screened,
+                "total_jobs_with_screenings": jobs_with_screenings,
+                "jobs_summary": jobs_summary
+            }
+        
+        except Exception as e:
+            raise Exception(f"Failed to get user statistics: {str(e)}")

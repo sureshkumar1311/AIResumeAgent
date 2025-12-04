@@ -21,7 +21,10 @@ from models import (
     LoginResponse,
     UserResponse,
     JobListingResponse,
-    JobListingRequest
+    JobListingRequest,
+    UserStatisticsResponse,  
+    ResumeScreeningRequest,  
+    ResumeBase64
 )
 from services.azure_blob_service import AzureBlobService
 from services.document_parser import DocumentParser
@@ -107,6 +110,51 @@ async def get_current_user(
     return user
 
 
+@app.get("/api/user/statistics", response_model=UserStatisticsResponse)
+async def get_user_statistics(current_user: Dict = Depends(get_current_user)):
+    """
+    Get comprehensive statistics for current user (Protected)
+    
+    Returns:
+        UserStatisticsResponse with:
+        - Total job descriptions uploaded
+        - Total resumes screened across all jobs
+        - Number of jobs with screenings
+        - Summary of each job with screening counts
+    
+    Example Response:
+    {
+        "user_id": "abc-123",
+        "total_job_descriptions": 15,
+        "total_resumes_screened": 87,
+        "total_jobs_with_screenings": 12,
+        "jobs_summary": [
+            {
+                "job_id": "job-1",
+                "screening_name": "Python Developer",
+                "created_at": "2024-12-01T10:00:00",
+                "total_screenings": 25,
+                "must_have_skills": ["Python", "FastAPI"],
+                "nice_to_have_skills": ["Docker"]
+            }
+        ]
+    }
+    """
+    try:
+        stats = await cosmos_service.get_user_statistics(current_user["user_id"])
+        
+        return UserStatisticsResponse(
+            user_id=stats["user_id"],
+            total_job_descriptions=stats["total_job_descriptions"],
+            total_resumes_screened=stats["total_resumes_screened"],
+            total_jobs_with_screenings=stats["total_jobs_with_screenings"],
+            jobs_summary=stats["jobs_summary"]
+        )
+    
+    except Exception as e:
+        print(f"Error in get_user_statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
 # ==================== PUBLIC ENDPOINTS ====================
 
 @app.get("/")
@@ -470,44 +518,55 @@ async def upload_job_description(
 
 @app.post("/api/screen-resumes", response_model=ResumeScreeningResponse)
 async def screen_resumes(
-    job_id: str = Form(...),
-    resumes: List[UploadFile] = File(...),
+    request: ResumeScreeningRequest,
     current_user: Dict = Depends(get_current_user)
 ):
     """
-    Screen resumes against job description (Protected - requires authentication)
+    Screen resumes against job description with JSON body (base64 files)
     
     Args:
-        job_id: Job ID
-        resumes: List of resume files
+        request: ResumeScreeningRequest with job_id and list of base64 resumes
         current_user: Authenticated user (injected by dependency)
     
     Returns:
-        ResumeScreeningResponse with candidate reports
+        ResumeScreeningResponse with candidate reports and processing time
+    
+    Example JSON Body:
+    {
+        "job_id": "abc-123-def",
+        "resumes": [
+            {
+                "resume_file": "data:application/pdf;base64,JVBERi0xLjQK...",
+                "filename": "john_doe_resume.pdf"
+            },
+            {
+                "resume_file": "data:application/pdf;base64,UEsDBBQABg...",
+                "filename": "jane_smith_resume.pdf"
+            }
+        ]
+    }
+    
+    Note: Response includes processing_time_seconds for performance monitoring
     """
+    # Start timing
+    import time
+    start_time = time.time()
+    
     try:
-        if not resumes:
+        if not request.resumes:
             raise HTTPException(
                 status_code=400,
-                detail="At least one resume file is required"
+                detail="At least one resume is required"
             )
         
-        if len(resumes) > settings.MAX_RESUMES_PER_BATCH:
+        if len(request.resumes) > settings.MAX_RESUMES_PER_BATCH:
             raise HTTPException(
                 status_code=400,
                 detail=f"Maximum {settings.MAX_RESUMES_PER_BATCH} resumes allowed per batch"
             )
         
-        # Validate file types
-        for resume in resumes:
-            if not resume.filename.lower().endswith(('.pdf', '.docx', '.doc')):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid file format for {resume.filename}"
-                )
-        
         # Retrieve job description
-        job_data = await cosmos_service.get_job_description(job_id, current_user["user_id"])
+        job_data = await cosmos_service.get_job_description(request.job_id, current_user["user_id"])
         if not job_data:
             raise HTTPException(
                 status_code=404,
@@ -516,25 +575,112 @@ async def screen_resumes(
         
         candidate_reports = []
         
+        print(f"Starting to process {len(request.resumes)} resume(s)...")
+        
         # Process each resume
-        for resume_file in resumes:
+        for idx, resume_data in enumerate(request.resumes, 1):
+            resume_start_time = time.time()
+            
             try:
-                resume_content = await resume_file.read()
+                # Extract base64 data and determine file type
+                base64_data = resume_data.resume_file
+                file_extension = None
+                content_type = None
+                filename = resume_data.filename
                 
-                # Upload resume
+                # Check if it's a data URI (data:mime/type;base64,xxxxx)
+                if base64_data.startswith('data:'):
+                    try:
+                        header, encoded = base64_data.split(',', 1)
+                        mime_type = header.split(':')[1].split(';')[0]
+                        base64_data = encoded
+                        
+                        # Determine file extension from MIME type
+                        if 'pdf' in mime_type.lower():
+                            file_extension = '.pdf'
+                            content_type = 'application/pdf'
+                        elif 'word' in mime_type.lower() or 'document' in mime_type.lower():
+                            file_extension = '.docx'
+                            content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                        elif 'msword' in mime_type.lower():
+                            file_extension = '.doc'
+                            content_type = 'application/msword'
+                        else:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Resume {idx}: Unsupported MIME type: {mime_type}"
+                            )
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Resume {idx}: Invalid data URI format"
+                        )
+                else:
+                    # No data URI - detect from file signature
+                    try:
+                        decoded_preview = base64.b64decode(base64_data[:100])
+                        
+                        if decoded_preview.startswith(b'%PDF'):
+                            file_extension = '.pdf'
+                            content_type = 'application/pdf'
+                        elif decoded_preview.startswith(b'PK\x03\x04'):
+                            file_extension = '.docx'
+                            content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                        elif decoded_preview.startswith(b'\xD0\xCF\x11\xE0'):
+                            file_extension = '.doc'
+                            content_type = 'application/msword'
+                        else:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Resume {idx}: Unable to detect file type"
+                            )
+                    except Exception as e:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Resume {idx}: Unable to detect file type from base64 content"
+                        )
+                
+                # Generate filename if not provided
+                if not filename:
+                    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                    filename = f"resume_{timestamp}_{idx}{file_extension}"
+                elif not filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                    # Append detected extension if filename doesn't have one
+                    filename = f"{filename}{file_extension}"
+                
+                # Decode base64 to bytes
+                try:
+                    resume_content = base64.b64decode(base64_data)
+                except base64.binascii.Error:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Resume {idx}: Invalid base64 encoding"
+                    )
+                
+                # Validate file size
+                file_size_mb = len(resume_content) / (1024 * 1024)
+                if file_size_mb > settings.MAX_FILE_SIZE_MB:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Resume {idx} ({filename}): File size ({file_size_mb:.2f}MB) exceeds maximum ({settings.MAX_FILE_SIZE_MB}MB)"
+                    )
+                
+                # Upload resume to blob storage
                 resume_blob_url = await blob_service.upload_file(
                     resume_content,
-                    f"resumes/{job_id}/{datetime.utcnow().timestamp()}_{resume_file.filename}",
-                    content_type=resume_file.content_type
+                    f"resumes/{request.job_id}/{datetime.utcnow().timestamp()}_{filename}",
+                    content_type=content_type
                 )
                 
-                # Parse resume
+                print(f"Processing resume {idx}/{len(request.resumes)}: {filename} ({file_size_mb:.2f}MB)")
+                
+                # Parse resume text
                 resume_text = await document_parser.parse_document(
                     resume_content,
-                    resume_file.filename
+                    filename
                 )
                 
-                print(f"Screening resume: {resume_file.filename}")
+                print(f"Screening resume: {filename}")
                 print(f"Using must-have skills: {job_data['must_have_skills']}")
                 print(f"Using nice-to-have skills: {job_data['nice_to_have_skills']}")
                 
@@ -542,11 +688,12 @@ async def screen_resumes(
                 screening_result = await ai_service.screen_candidate(
                     resume_text=resume_text,
                     job_description=job_data["job_description_text"],
-                    must_have_skills=job_data["must_have_skills"],  # List of strings
-                    nice_to_have_skills=job_data["nice_to_have_skills"]  # List of strings
+                    must_have_skills=job_data["must_have_skills"],
+                    nice_to_have_skills=job_data["nice_to_have_skills"]
                 )
                 
-                print(f"Screening completed. Fit score: {screening_result['fit_score']['score']}")
+                resume_processing_time = time.time() - resume_start_time
+                print(f"Screening completed for {filename}. Fit score: {screening_result['fit_score']['score']}% (took {resume_processing_time:.2f}s)")
                 
                 # Create candidate report
                 candidate_report = CandidateReport(
@@ -557,7 +704,7 @@ async def screen_resumes(
                     location=screening_result["candidate_info"]["location"],
                     total_experience=screening_result["candidate_info"]["total_experience"],
                     resume_url=resume_blob_url,
-                    resume_filename=resume_file.filename,
+                    resume_filename=filename,
                     fit_score=screening_result["fit_score"],
                     must_have_skills_matched=screening_result["skills_analysis"]["must_have_matched"],
                     must_have_skills_total=screening_result["skills_analysis"]["must_have_total"],
@@ -573,28 +720,38 @@ async def screen_resumes(
                 
                 # Save to database
                 await cosmos_service.save_screening_result(
-                    job_id=job_id,
+                    job_id=request.job_id,
                     user_id=current_user["user_id"],
                     candidate_report=candidate_report.dict()
                 )
                 
                 candidate_reports.append(candidate_report)
                 
+            except HTTPException:
+                raise
             except Exception as e:
-                print(f"Error processing resume {resume_file.filename}: {str(e)}")
+                print(f"Error processing resume {idx} ({filename if filename else 'unknown'}): {str(e)}")
+                # Continue with other resumes instead of failing completely
                 continue
         
         if not candidate_reports:
             raise HTTPException(
                 status_code=500,
-                detail="Failed to process any resumes"
+                detail="Failed to process any resumes. Please check file formats and try again."
             )
         
+        # Calculate total processing time
+        total_processing_time = time.time() - start_time
+        
+        print(f"✅ Successfully processed {len(candidate_reports)}/{len(request.resumes)} resume(s) in {total_processing_time:.2f} seconds")
+        print(f"📊 Average time per resume: {total_processing_time/len(candidate_reports):.2f} seconds")
+        
         return ResumeScreeningResponse(
-            job_id=job_id,
+            job_id=request.job_id,
             total_resumes_processed=len(candidate_reports),
             candidates=candidate_reports,
-            processing_timestamp=datetime.utcnow().isoformat()
+            processing_timestamp=datetime.utcnow().isoformat(),
+            processing_time_seconds=round(total_processing_time, 2)
         )
     
     except HTTPException:
@@ -602,7 +759,6 @@ async def screen_resumes(
     except Exception as e:
         print(f"Error in screen_resumes: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/api/jobs")
 async def get_all_jobs(current_user: Dict = Depends(get_current_user)):

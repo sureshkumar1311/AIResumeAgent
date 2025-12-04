@@ -219,3 +219,37 @@ class ErrorResponse(BaseModel):
     error: str
     detail: str
     timestamp: str
+
+# Add these models at the end of models.py
+
+# ==================== USER STATISTICS MODELS ====================
+
+class UserStatisticsResponse(BaseModel):
+    """User statistics response"""
+    user_id: str
+    total_job_descriptions: int = Field(..., description="Total number of job descriptions uploaded by user")
+    total_resumes_screened: int = Field(..., description="Total number of resumes screened across all jobs")
+    total_jobs_with_screenings: int = Field(..., description="Number of jobs that have at least one screening")
+    jobs_summary: List[Dict] = Field(..., description="Summary of each job with screening count")
+
+
+# ==================== RESUME SCREENING WITH BASE64 MODELS ====================
+
+class ResumeBase64(BaseModel):
+    """Single resume in base64 format"""
+    resume_file: str = Field(..., description="Base64 encoded resume content (with or without data URI prefix)")
+    filename: Optional[str] = Field(None, description="Original filename (optional, will be auto-generated if not provided)")
+
+
+class ResumeScreeningRequest(BaseModel):
+    """Request model for screening resumes with base64"""
+    job_id: str = Field(..., description="Job ID to screen resumes against")
+    resumes: List[ResumeBase64] = Field(..., min_items=1, description="List of resumes in base64 format")
+
+class ResumeScreeningResponse(BaseModel):
+    """Response for resume screening endpoint"""
+    job_id: str
+    total_resumes_processed: int
+    candidates: List[CandidateReport]
+    processing_timestamp: str
+    processing_time_seconds: float = Field(..., description="Total time taken to process all resumes in seconds")
