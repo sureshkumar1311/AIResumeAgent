@@ -175,8 +175,8 @@ class CosmosDBService:
         user_id: str,
         screening_name: str,
         job_description_text: str,
-        must_have_skills: List[Dict],
-        nice_to_have_skills: List[Dict],
+        must_have_skills: List[str],  # Changed from List[Dict] to List[str]
+        nice_to_have_skills: List[str],  # Changed from List[Dict] to List[str]
         filename: Optional[str] = None,
         blob_url: Optional[str] = None
     ) -> str:
@@ -187,8 +187,8 @@ class CosmosDBService:
             user_id: ID of the user creating this job
             screening_name: Name/title for this screening
             job_description_text: Extracted or manual job description text
-            must_have_skills: List of must-have skills
-            nice_to_have_skills: List of nice-to-have skills
+            must_have_skills: List of must-have skill strings (auto-extracted)
+            nice_to_have_skills: List of nice-to-have skill strings (auto-extracted)
             filename: Optional original filename or "Manual Entry"
             blob_url: Optional Azure Blob URL for the job description file
         
@@ -205,8 +205,8 @@ class CosmosDBService:
                 "screening_name": screening_name,
                 "job_description_text": job_description_text,
                 "filename": filename if filename else "Manual Entry",
-                "must_have_skills": must_have_skills,
-                "nice_to_have_skills": nice_to_have_skills,
+                "must_have_skills": must_have_skills,  # Now just list of strings
+                "nice_to_have_skills": nice_to_have_skills,  # Now just list of strings
                 "created_at": datetime.utcnow().isoformat(),
                 "total_screenings": 0,
                 "total_candidates": 0,
@@ -225,6 +225,8 @@ class CosmosDBService:
         
         except Exception as e:
             raise Exception(f"Failed to create job description in database: {str(e)}")
+        
+    
     
     async def get_job_description(self, job_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -428,82 +430,93 @@ class CosmosDBService:
         except Exception as e:
             raise Exception(f"Failed to retrieve all jobs with counts: {str(e)}")
         
+    # Add this method to the CosmosDBService class
+
     async def get_jobs_with_filters(
         self,
         user_id: str,
         search: Optional[str] = None,
         page_number: int = 1,
         page_size: int = 10,
-        sort_by: str = "all"
+        sort_by: str = "recent"
     ) -> Dict[str, Any]:
         """
-        Get jobs for a user with search, pagination, and date filtering
+        Get jobs for a user with advanced filtering, pagination, and sorting
         
         Args:
             user_id: User ID
-            search: Optional search term for screening_name
-            page_number: Page number (1-indexed)
-            page_size: Number of records per page
-            sort_by: Date filter - "week", "month", or "all"
+            search: Search term for screening_name or job_description_text
+            page_number: Page number (starts from 1)
+            page_size: Number of items per page
+            sort_by: Sort order - 'recent', 'oldest', 'week', 'month', 'name'
         
         Returns:
-            Dictionary with paginated results and metadata
+            Dictionary with jobs, pagination metadata
         """
         try:
             from datetime import datetime, timedelta
             
-            # Build the query
-            query_parts = ["SELECT * FROM c WHERE c.user_id = @user_id"]
+            # Build query conditions
+            conditions = ["c.user_id = @user_id"]
             parameters = [{"name": "@user_id", "value": user_id}]
             
-            # Add date filter
-            if sort_by == "week":
-                one_week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
-                query_parts.append("AND c.created_at >= @date_filter")
-                parameters.append({"name": "@date_filter", "value": one_week_ago})
-            elif sort_by == "month":
-                one_month_ago = (datetime.utcnow() - timedelta(days=30)).isoformat()
-                query_parts.append("AND c.created_at >= @date_filter")
-                parameters.append({"name": "@date_filter", "value": one_month_ago})
-            # "all" doesn't add any date filter
-            
             # Add search filter
-            if search and search.strip():
-                query_parts.append("AND (CONTAINS(LOWER(c.screening_name), @search) OR CONTAINS(LOWER(c.job_description_text), @search))")
-                parameters.append({"name": "@search", "value": search.lower().strip()})
+            if search:
+                conditions.append("(CONTAINS(LOWER(c.screening_name), LOWER(@search)) OR CONTAINS(LOWER(c.job_description_text), LOWER(@search)))")
+                parameters.append({"name": "@search", "value": search})
             
-            # Add sorting (most recent first)
-            query_parts.append("ORDER BY c.created_at DESC")
+            # Add date filters for 'week' or 'month'
+            if sort_by == "week":
+                week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+                conditions.append("c.created_at >= @date_filter")
+                parameters.append({"name": "@date_filter", "value": week_ago})
+            elif sort_by == "month":
+                month_ago = (datetime.utcnow() - timedelta(days=30)).isoformat()
+                conditions.append("c.created_at >= @date_filter")
+                parameters.append({"name": "@date_filter", "value": month_ago})
             
-            # Build complete query
-            query = " ".join(query_parts)
+            # Build WHERE clause
+            where_clause = " AND ".join(conditions)
             
-            # Execute query to get all matching items
-            all_items = list(self.jobs_container.query_items(
+            # Determine ORDER BY clause
+            if sort_by == "oldest":
+                order_by = "ORDER BY c.created_at ASC"
+            elif sort_by == "name":
+                order_by = "ORDER BY c.screening_name ASC"
+            else:  # 'recent', 'week', 'month' all sort by recent
+                order_by = "ORDER BY c.created_at DESC"
+            
+            # Count total matching jobs
+            count_query = f"SELECT VALUE COUNT(1) FROM c WHERE {where_clause}"
+            count_result = list(self.jobs_container.query_items(
+                query=count_query,
+                parameters=parameters,
+                enable_cross_partition_query=False,
+                partition_key=user_id
+            ))
+            total_jobs = count_result[0] if count_result else 0
+            
+            # Calculate pagination
+            total_pages = (total_jobs + page_size - 1) // page_size  # Ceiling division
+            offset = (page_number - 1) * page_size
+            
+            # Get paginated jobs
+            query = f"""
+            SELECT * FROM c 
+            WHERE {where_clause}
+            {order_by}
+            OFFSET {offset} LIMIT {page_size}
+            """
+            
+            items = list(self.jobs_container.query_items(
                 query=query,
                 parameters=parameters,
                 enable_cross_partition_query=False,
                 partition_key=user_id
             ))
             
-            # Calculate pagination
-            total_jobs = len(all_items)
-            total_pages = (total_jobs + page_size - 1) // page_size  # Ceiling division
-            
-            # Validate page_number
-            if page_number < 1:
-                page_number = 1
-            if page_number > total_pages and total_pages > 0:
-                page_number = total_pages
-            
-            # Calculate offset
-            offset = (page_number - 1) * page_size
-            
-            # Get paginated items
-            paginated_items = all_items[offset:offset + page_size]
-            
             # Enrich each job with screening counts
-            for job in paginated_items:
+            for job in items:
                 job_id = job.get("job_id")
                 
                 # Get count of screenings for this job
@@ -519,7 +532,6 @@ class CosmosDBService:
                     ))
                     
                     actual_count = count_result[0] if count_result else 0
-                    
                     job["total_screenings"] = actual_count
                     job["total_candidates"] = actual_count
                     
@@ -530,14 +542,14 @@ class CosmosDBService:
             
             return {
                 "total_jobs": total_jobs,
-                "total_pages": total_pages if total_pages > 0 else 1,
+                "total_pages": total_pages,
                 "current_page": page_number,
                 "page_size": page_size,
-                "jobs": paginated_items
+                "jobs": items
             }
         
         except Exception as e:
-            raise Exception(f"Failed to retrieve jobs with filters: {str(e)}")
+            raise Exception(f"Failed to get jobs with filters: {str(e)}")
     
     async def get_statistics(self, job_id: str) -> Dict[str, Any]:
         """

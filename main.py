@@ -8,9 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import List, Optional, Dict
 import json
+import base64
 from datetime import datetime
 
 from models import (
+    JobDescriptionRequest,
     JobDescriptionResponse,
     ResumeScreeningResponse,
     CandidateReport,
@@ -20,7 +22,6 @@ from models import (
     UserResponse,
     JobListingResponse,
     JobListingRequest
-
 )
 from services.azure_blob_service import AzureBlobService
 from services.document_parser import DocumentParser
@@ -269,109 +270,201 @@ async def get_current_user_info(current_user: Dict = Depends(get_current_user)):
 
 @app.post("/api/job-description", response_model=JobDescriptionResponse)
 async def upload_job_description(
-    screening_name: str = Form(...),
-    must_have_skills: str = Form(...),
-    nice_to_have_skills: str = Form(...),
-    job_description_file: UploadFile = File(None),
-    description: str = Form(None),
+    job_data: JobDescriptionRequest,
     current_user: Dict = Depends(get_current_user)
 ):
     """
-    Upload job description and skills (Protected - requires authentication)
+    Upload job description with JSON body (supports base64 file or text)
     
     Args:
-        screening_name: Name/title for this screening
-        job_description_file: Optional PDF or Word document
-        description: Optional manual text entry
-        must_have_skills: JSON array of skill strings
-        nice_to_have_skills: JSON array of skill strings
+        job_data: Job description request with screening_name, job_description_file (base64), 
+                  or description text
         current_user: Authenticated user (injected by dependency)
     
     Returns:
-        JobDescriptionResponse with job_id
+        JobDescriptionResponse with job_id and auto-extracted skills
+    
+    Example JSON Body with Base64 File:
+    {
+        "screening_name": "Senior Python Developer - Q4 2024",
+        "job_description_file": "data:application/pdf;base64,JVBERi0xLjQKJeLjz9MKMyAwIG9iago8PC9UeXBlIC9QYWdlCi9QYXJlbn..."
+    }
+    
+    OR with just base64:
+    {
+        "screening_name": "Senior Python Developer - Q4 2024",
+        "job_description_file": "JVBERi0xLjQKJeLjz9MKMyAwIG9iago8PC9UeXBlIC9QYWdlCi9QYXJlbn..."
+    }
+    
+    OR with manual text:
+    {
+        "screening_name": "Senior Python Developer - Q4 2024",
+        "description": "We are looking for a senior Python developer..."
+    }
     """
     try:
         # Validate inputs
-        if not job_description_file and not description:
+        if not job_data.job_description_file and not job_data.description:
             raise HTTPException(
                 status_code=400,
-                detail="Either job_description_file or description text must be provided."
+                detail="Either job_description_file (base64) or description text must be provided."
             )
         
-        if job_description_file and description:
+        if job_data.job_description_file and job_data.description:
             raise HTTPException(
                 status_code=400,
                 detail="Please provide either job_description_file OR description text, not both."
-            )
-        
-        # Validate file type if provided
-        if job_description_file and job_description_file.filename:
-            if not job_description_file.filename.lower().endswith(('.pdf', '.docx', '.doc')):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid file format. Only PDF and Word documents are supported."
-                )
-        
-        # Parse skills
-        try:
-            must_have_skills_list = json.loads(must_have_skills)
-            nice_to_have_skills_list = json.loads(nice_to_have_skills)
-            
-            must_have_skills_objects = [
-                {"skill": skill, "weight": 8} for skill in must_have_skills_list
-            ]
-            nice_to_have_skills_objects = [
-                {"skill": skill, "weight": 5} for skill in nice_to_have_skills_list
-            ]
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid JSON format for skills"
             )
         
         blob_url = None
         filename = None
         job_description_text = None
         
-        # Process file upload if provided
-        if job_description_file and job_description_file.filename:
-            file_content = await job_description_file.read()
-            blob_url = await blob_service.upload_file(
-                file_content,
-                f"job-descriptions/{current_user['user_id']}/{datetime.utcnow().timestamp()}_{job_description_file.filename}",
-                content_type=job_description_file.content_type
-            )
-            filename = job_description_file.filename
-            job_description_text = await document_parser.parse_document(
-                file_content,
-                job_description_file.filename
-            )
+        # Process base64 file if provided
+        if job_data.job_description_file:
+            try:
+                # Extract base64 data and determine file type
+                base64_data = job_data.job_description_file
+                file_extension = None
+                content_type = None
+                
+                # Check if it's a data URI (data:mime/type;base64,xxxxx)
+                if base64_data.startswith('data:'):
+                    # Extract MIME type and base64 data
+                    try:
+                        header, encoded = base64_data.split(',', 1)
+                        mime_type = header.split(':')[1].split(';')[0]
+                        base64_data = encoded
+                        
+                        # Determine file extension from MIME type
+                        if 'pdf' in mime_type.lower():
+                            file_extension = '.pdf'
+                            content_type = 'application/pdf'
+                        elif 'word' in mime_type.lower() or 'document' in mime_type.lower():
+                            file_extension = '.docx'
+                            content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                        elif 'msword' in mime_type.lower():
+                            file_extension = '.doc'
+                            content_type = 'application/msword'
+                        else:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Unsupported MIME type: {mime_type}. Only PDF and Word documents are supported."
+                            )
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Invalid data URI format. Expected format: data:mime/type;base64,xxxxx"
+                        )
+                else:
+                    # No data URI prefix - try to detect file type from base64 content
+                    # Decode first few bytes to detect file signature
+                    try:
+                        decoded_preview = base64.b64decode(base64_data[:100])
+                        
+                        # PDF signature: %PDF
+                        if decoded_preview.startswith(b'%PDF'):
+                            file_extension = '.pdf'
+                            content_type = 'application/pdf'
+                        # DOCX signature: PK (ZIP format)
+                        elif decoded_preview.startswith(b'PK\x03\x04'):
+                            file_extension = '.docx'
+                            content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                        # DOC signature: D0CF11E0 (OLE format)
+                        elif decoded_preview.startswith(b'\xD0\xCF\x11\xE0'):
+                            file_extension = '.doc'
+                            content_type = 'application/msword'
+                        else:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Unable to detect file type. Please provide base64 with data URI prefix (data:application/pdf;base64,...) or ensure file is PDF/DOCX format."
+                            )
+                    except Exception as e:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Unable to detect file type from base64 content. Please use data URI format."
+                        )
+                
+                # Generate filename with timestamp
+                timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                filename = f"job_description_{timestamp}{file_extension}"
+                
+                # Decode base64 to bytes
+                file_content = base64.b64decode(base64_data)
+                
+                # Validate file size (optional)
+                file_size_mb = len(file_content) / (1024 * 1024)
+                if file_size_mb > settings.MAX_FILE_SIZE_MB:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File size ({file_size_mb:.2f}MB) exceeds maximum allowed size ({settings.MAX_FILE_SIZE_MB}MB)"
+                    )
+                
+                # Upload to blob storage
+                blob_url = await blob_service.upload_file(
+                    file_content,
+                    f"job-descriptions/{current_user['user_id']}/{timestamp}_{filename}",
+                    content_type=content_type
+                )
+                
+                print(f"File uploaded: {filename} ({file_size_mb:.2f}MB)")
+                
+                # Parse document to extract text
+                job_description_text = await document_parser.parse_document(
+                    file_content,
+                    filename
+                )
+                
+            except base64.binascii.Error:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid base64 encoding for job_description_file"
+                )
+            except HTTPException:
+                raise
+            except Exception as e:
+                print(f"Error processing file: {str(e)}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to process file: {str(e)}"
+                )
         else:
-            job_description_text = description
+            # Use manual description text
+            job_description_text = job_data.description
             filename = "Manual Entry"
         
-        # Create job entry
+        # Auto-extract technical skills from job description
+        print(f"Extracting skills from job description...")
+        must_have_skills, nice_to_have_skills = await ai_service.extract_skills_from_jd(
+            job_description_text
+        )
+        
+        print(f"Extracted must-have skills: {must_have_skills}")
+        print(f"Extracted nice-to-have skills: {nice_to_have_skills}")
+        
+        # Create job entry with auto-extracted skills
         job_id = await cosmos_service.create_job_description(
             user_id=current_user["user_id"],
-            screening_name=screening_name,
+            screening_name=job_data.screening_name,
             job_description_text=job_description_text,
-            must_have_skills=must_have_skills_objects,
-            nice_to_have_skills=nice_to_have_skills_objects,
+            must_have_skills=must_have_skills,  # List of strings
+            nice_to_have_skills=nice_to_have_skills,  # List of strings
             filename=filename,
             blob_url=blob_url
         )
         
         return JobDescriptionResponse(
             job_id=job_id,
-            message="Job description uploaded successfully",
-            blob_url=blob_url if blob_url else "Manual entry - no file uploaded",
-            must_have_skills_count=len(must_have_skills_list),
-            nice_to_have_skills_count=len(nice_to_have_skills_list)
+            message="Job description uploaded successfully and skills auto-extracted",
+            blob_url=blob_url,
+            must_have_skills=must_have_skills,
+            nice_to_have_skills=nice_to_have_skills
         )
     
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error in upload_job_description: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -441,13 +534,19 @@ async def screen_resumes(
                     resume_file.filename
                 )
                 
+                print(f"Screening resume: {resume_file.filename}")
+                print(f"Using must-have skills: {job_data['must_have_skills']}")
+                print(f"Using nice-to-have skills: {job_data['nice_to_have_skills']}")
+                
                 # Perform AI screening
                 screening_result = await ai_service.screen_candidate(
                     resume_text=resume_text,
                     job_description=job_data["job_description_text"],
-                    must_have_skills=job_data["must_have_skills"],
-                    nice_to_have_skills=job_data["nice_to_have_skills"]
+                    must_have_skills=job_data["must_have_skills"],  # List of strings
+                    nice_to_have_skills=job_data["nice_to_have_skills"]  # List of strings
                 )
+                
+                print(f"Screening completed. Fit score: {screening_result['fit_score']['score']}")
                 
                 # Create candidate report
                 candidate_report = CandidateReport(
@@ -501,6 +600,7 @@ async def screen_resumes(
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error in screen_resumes: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -545,6 +645,13 @@ async def get_jobs_with_filters(
         "pageSize": 10,
         "sortBy": "week"
     }
+    
+    Sort Options:
+    - "recent": Most recent first (default)
+    - "oldest": Oldest first
+    - "week": Jobs from last 7 days (sorted by recent)
+    - "month": Jobs from last 30 days (sorted by recent)
+    - "name": Alphabetical by screening_name
     """
     try:
         result = await cosmos_service.get_jobs_with_filters(
@@ -564,6 +671,7 @@ async def get_jobs_with_filters(
         )
     
     except Exception as e:
+        print(f"Error in get_jobs_with_filters: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

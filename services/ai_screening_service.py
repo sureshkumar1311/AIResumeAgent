@@ -1,17 +1,17 @@
 """
 AI Screening Service using Azure OpenAI
-Performs intelligent resume screening and analysis with CONSISTENT results
+Performs intelligent resume screening and analysis with IMPROVED scoring
 """
 
 from openai import AzureOpenAI
 from config import settings
 import json
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 
 class AIScreeningService:
-    """Service for AI-powered resume screening with deterministic results"""
+    """Service for AI-powered resume screening with improved fit scoring"""
     
     def __init__(self):
         """Initialize Azure OpenAI client"""
@@ -22,12 +22,85 @@ class AIScreeningService:
         )
         self.deployment_name = settings.AZURE_OPENAI_DEPLOYMENT_NAME
     
+    async def extract_skills_from_jd(self, job_description_text: str) -> Tuple[List[str], List[str]]:
+        """
+        Extract must-have and nice-to-have technical skills from job description
+        
+        Args:
+            job_description_text: Complete job description text
+        
+        Returns:
+            Tuple of (must_have_skills, nice_to_have_skills)
+        """
+        prompt = f"""
+        Analyze this job description and extract ONLY technical skills, tools, technologies, and programming languages.
+        
+        RULES:
+        1. Extract ONLY technical skills (languages, frameworks, tools, technologies, platforms)
+        2. DO NOT include: years of experience, soft skills, education requirements, certifications
+        3. Categorize into:
+           - Must-have: Core technical requirements explicitly stated as required/mandatory
+           - Nice-to-have: Preferred/bonus technical skills
+        
+        Examples of what TO include:
+        - Programming languages: Python, Java, JavaScript, C++
+        - Frameworks: React, Angular, Django, Spring Boot
+        - Tools: Git, Docker, Kubernetes, Jenkins
+        - Technologies: REST APIs, GraphQL, Microservices
+        - Platforms: AWS, Azure, GCP
+        - Databases: PostgreSQL, MongoDB, MySQL
+        
+        Examples of what NOT to include:
+        - "5+ years experience"
+        - "Bachelor's degree"
+        - "Strong communication skills"
+        - "Team player"
+        - "PMP certification"
+        
+        Job Description:
+        {job_description_text}
+        
+        Return ONLY a JSON object:
+        {{
+            "must_have_skills": ["skill1", "skill2", ...],
+            "nice_to_have_skills": ["skill1", "skill2", ...]
+        }}
+        
+        If you cannot clearly distinguish, put more critical/frequently mentioned skills in must_have.
+        """
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {"role": "system", "content": "You are an expert at analyzing job descriptions and extracting technical requirements. Return only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0,
+                max_tokens=2000
+            )
+            
+            content = response.choices[0].message.content.strip()
+            content = re.sub(r'```json\n?|\n?```', '', content)
+            
+            result = json.loads(content)
+            
+            must_have = result.get("must_have_skills", [])
+            nice_to_have = result.get("nice_to_have_skills", [])
+            
+            return must_have, nice_to_have
+        
+        except Exception as e:
+            print(f"Error extracting skills: {str(e)}")
+            # Return empty lists if extraction fails
+            return [], []
+    
     async def screen_candidate(
         self,
         resume_text: str,
         job_description: str,
-        must_have_skills: List[Dict],
-        nice_to_have_skills: List[Dict]
+        must_have_skills: List[str],
+        nice_to_have_skills: List[str]
     ) -> Dict[str, Any]:
         """
         Screen candidate resume against job requirements
@@ -35,8 +108,8 @@ class AIScreeningService:
         Args:
             resume_text: Parsed resume text
             job_description: Job description text
-            must_have_skills: List of must-have skills with weights
-            nice_to_have_skills: List of nice-to-have skills with weights
+            must_have_skills: List of must-have technical skills (auto-extracted)
+            nice_to_have_skills: List of nice-to-have technical skills (auto-extracted)
         
         Returns:
             Comprehensive screening analysis
@@ -52,13 +125,11 @@ class AIScreeningService:
                 nice_to_have_skills
             )
             
-            # Calculate fit score
-            fit_score = await self._calculate_fit_score(
+            # Calculate fit score (NEW: comprehensive analysis without heavy skill weighting)
+            fit_score = await self._calculate_comprehensive_fit_score(
                 resume_text,
                 job_description,
-                skills_analysis,
-                must_have_skills,
-                nice_to_have_skills
+                skills_analysis
             )
             
             # Generate AI summary
@@ -120,19 +191,17 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert resume parser. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0,  # Zero temperature for consistency
+                temperature=0,
                 max_tokens=800
             )
             
             content = response.choices[0].message.content.strip()
-            # Remove markdown code blocks if present
             content = re.sub(r'```json\n?|\n?```', '', content)
             
             result = json.loads(content)
             return result
         
         except Exception as e:
-            # Return default values if extraction fails
             return {
                 "name": "Unknown",
                 "email": "Not specified",
@@ -145,13 +214,10 @@ class AIScreeningService:
     async def _analyze_skills_match(
         self,
         resume_text: str,
-        must_have_skills: List[Dict],
-        nice_to_have_skills: List[Dict]
+        must_have_skills: List[str],
+        nice_to_have_skills: List[str]
     ) -> Dict[str, Any]:
-        """Analyze which skills match from the resume - uses full resume text"""
-        
-        must_have_list = [skill["skill"] for skill in must_have_skills]
-        nice_to_have_list = [skill["skill"] for skill in nice_to_have_skills]
+        """Analyze which skills match from the resume"""
         
         prompt = f"""
         Analyze this resume and determine which skills from the given lists are present.
@@ -161,7 +227,7 @@ class AIScreeningService:
         2. Consider variations and related technologies (e.g., "React.js" matches "React", "Python3" matches "Python")
         3. Look for the skill in work experience, projects, skills sections, or certifications
         4. Be consistent: if a skill is explicitly mentioned or clearly demonstrated, mark it as found
-        5. For proficiency and years: base on actual project duration and role complexity, not assumptions
+        5. For proficiency and years: base on actual project duration and role complexity
         
         For each skill found, estimate:
         - Proficiency level: Beginner (0-1 years), Intermediate (1-3 years), Advanced (3-5 years), Expert (5+ years)
@@ -170,8 +236,8 @@ class AIScreeningService:
         Resume (complete content):
         {resume_text}
         
-        Must-have skills to check: {', '.join(must_have_list)}
-        Nice-to-have skills to check: {', '.join(nice_to_have_list)}
+        Must-have skills to check: {', '.join(must_have_skills) if must_have_skills else 'None'}
+        Nice-to-have skills to check: {', '.join(nice_to_have_skills) if nice_to_have_skills else 'None'}
         
         Return a JSON object with this structure:
         {{
@@ -196,7 +262,7 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert technical recruiter analyzing resumes. Return only valid JSON. Be consistent and thorough."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0,  # Zero temperature for consistency
+                temperature=0,
                 max_tokens=4000
             )
             
@@ -244,7 +310,6 @@ class AIScreeningService:
             }
         
         except Exception as e:
-            # Return empty match if analysis fails
             return {
                 "must_have_matched": 0,
                 "must_have_total": len(must_have_skills),
@@ -254,62 +319,73 @@ class AIScreeningService:
                 "matched_nice_to_have_list": []
             }
     
-    async def _calculate_fit_score(
+    async def _calculate_comprehensive_fit_score(
         self,
         resume_text: str,
         job_description: str,
-        skills_analysis: Dict,
-        must_have_skills: List[Dict],
-        nice_to_have_skills: List[Dict]
+        skills_analysis: Dict
     ) -> Dict[str, Any]:
-        """Calculate overall fit score - uses full text without truncation"""
+        """
+        Calculate comprehensive fit score based on OVERALL match, not just skills
+        This addresses the issue of low scores for good candidates
+        """
         
-        # Calculate weighted skill match
-        total_must_have_weight = sum(skill.get("weight", 5) for skill in must_have_skills)
-        total_nice_to_have_weight = sum(skill.get("weight", 3) for skill in nice_to_have_skills)
-        
-        matched_must_have_weight = 0
-        high_weight_skills = []
-        
-        for skill_match in skills_analysis["matched_must_have_list"]:
-            if skill_match["found_in_resume"]:
-                skill_obj = next((s for s in must_have_skills if s["skill"] == skill_match["skill"]), None)
-                if skill_obj:
-                    weight = skill_obj.get("weight", 5)
-                    matched_must_have_weight += weight
-                    if weight >= 8:  # High weight threshold
-                        high_weight_skills.append(skill_match["skill"])
-        
-        matched_nice_to_have_weight = 0
-        for skill_match in skills_analysis["matched_nice_to_have_list"]:
-            if skill_match["found_in_resume"]:
-                skill_obj = next((s for s in nice_to_have_skills if s["skill"] == skill_match["skill"]), None)
-                if skill_obj:
-                    matched_nice_to_have_weight += skill_obj.get("weight", 3)
-        
-        # Calculate base score from skills (70% weight)
-        must_have_score = (matched_must_have_weight / total_must_have_weight * 100) if total_must_have_weight > 0 else 0
-        nice_to_have_score = (matched_nice_to_have_weight / total_nice_to_have_weight * 100) if total_nice_to_have_weight > 0 else 0
-        
-        skills_score = (must_have_score * 0.85 + nice_to_have_score * 0.15)
-        
-        # Get AI assessment of overall fit (30% weight) - uses full content
         prompt = f"""
-        Rate how well this candidate matches the job requirements on a scale of 0-100.
+        You are an expert recruiter evaluating how well this candidate matches the job requirements.
+        Provide a comprehensive fit score from 0-100 based on the COMPLETE picture.
         
-        SCORING GUIDELINES FOR CONSISTENCY:
-        - 80-100: Exceptional match - exceeds most requirements, relevant experience, clear expertise
-        - 60-79: Good match - meets most requirements, relevant experience
-        - 40-59: Moderate match - meets some requirements, some relevant experience
-        - 20-39: Weak match - meets few requirements, limited relevant experience  
-        - 0-19: Poor match - minimal alignment with requirements
+        CRITICAL SCORING GUIDELINES:
         
-        Consider these factors:
-        1. Years of relevant experience match job requirements
-        2. Job responsibilities align with job description
-        3. Career progression shows growth in relevant areas
-        4. Industry experience is relevant
-        5. Education and certifications align
+        **90-100 (Exceptional Match):**
+        - Exceeds most job requirements significantly
+        - 5+ years relevant experience for senior roles, 3+ for mid-level
+        - Demonstrates deep expertise in core technical areas
+        - Has worked on similar projects/domains
+        - Strong career progression and achievements
+        
+        **75-89 (Strong Match):**
+        - Meets all major requirements well
+        - Relevant experience level matches job needs
+        - Good technical skill coverage
+        - Relevant industry/domain experience
+        - Clear evidence of capability
+        
+        **60-74 (Good Match):**
+        - Meets most key requirements
+        - May lack 1-2 secondary requirements
+        - Reasonable experience level
+        - Transferable skills present
+        - Could succeed with some ramp-up
+        
+        **45-59 (Moderate Match):**
+        - Meets some requirements
+        - May have less experience than preferred
+        - Some skill gaps in secondary areas
+        - Would need training/development
+        
+        **30-44 (Weak Match):**
+        - Meets few requirements
+        - Significant experience or skill gaps
+        - Different domain/industry background
+        - Major gaps in core competencies
+        
+        **0-29 (Poor Match):**
+        - Minimal alignment
+        - Wrong career level or domain
+        - Missing most critical requirements
+        
+        EVALUATION FACTORS (weight them appropriately):
+        1. **Technical Skills (30%)**: How many relevant technical skills does candidate have?
+        2. **Experience Level (25%)**: Does years of experience match job requirements?
+        3. **Role Relevance (20%)**: How similar is past work to this job's responsibilities?
+        4. **Domain Knowledge (15%)**: Relevant industry/domain experience?
+        5. **Career Trajectory (10%)**: Shows growth and increasing responsibility?
+        
+        IMPORTANT: 
+        - Don't penalize heavily for missing a few nice-to-have skills if overall profile is strong
+        - Focus on transferable experience and learning ability
+        - Consider the WHOLE picture, not just a checklist
+        - Be realistic but fair - a 70-80% match is actually quite good!
         
         Job Description (complete):
         {job_description}
@@ -317,38 +393,48 @@ class AIScreeningService:
         Resume (complete):
         {resume_text}
         
-        Be objective and consistent. Base your score on actual evidence in the resume.
+        Skills Analysis:
+        - Must-have skills matched: {skills_analysis['must_have_matched']} of {skills_analysis['must_have_total']}
+        - Nice-to-have skills matched: {skills_analysis['nice_to_have_matched']} of {skills_analysis['nice_to_have_total']}
         
-        Return ONLY a JSON object: {{"ai_fit_score": score_number, "reasoning": "brief reason"}}
+        Return ONLY a JSON object:
+        {{
+            "score": <number 0-100>,
+            "reasoning": "<2-3 sentence explanation of the score>"
+        }}
+        
+        Be objective, thorough, and fair in your assessment.
         """
         
         try:
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert recruiter who provides consistent, objective assessments. Return only valid JSON."},
+                    {"role": "system", "content": "You are an expert recruiter who provides fair, comprehensive, and accurate candidate assessments. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0,  # Zero temperature for consistency
-                max_tokens=500
+                temperature=0,
+                max_tokens=800
             )
             
             content = response.choices[0].message.content.strip()
             content = re.sub(r'```json\n?|\n?```', '', content)
             result = json.loads(content)
-            ai_score = result.get("ai_fit_score", 50)
+            
+            score = min(100, max(0, result.get("score", 50)))
+            reasoning = result.get("reasoning", "Score based on overall profile match")
+            
+            return {
+                "score": int(score),
+                "reasoning": reasoning
+            }
         
-        except:
-            ai_score = 50
-        
-        # Combine scores
-        final_score = int(skills_score * 0.70 + ai_score * 0.30)
-        final_score = min(100, max(0, final_score))
-        
-        return {
-            "score": final_score,
-            "weighted_skills_contributing": high_weight_skills[:3]
-        }
+        except Exception as e:
+            print(f"Error calculating fit score: {str(e)}")
+            return {
+                "score": 50,
+                "reasoning": "Unable to calculate detailed fit score. Manual review recommended."
+            }
     
     async def _generate_ai_summary(
         self,
@@ -356,11 +442,11 @@ class AIScreeningService:
         job_description: str,
         skills_analysis: Dict
     ) -> List[str]:
-        """Generate AI summary points about the candidate - uses full text"""
+        """Generate AI summary points about the candidate"""
         
         prompt = f"""
         Create 3-4 concise bullet points summarizing this candidate's strengths and fit for the role.
-        Focus on: key skills, experience relevance, notable achievements, and areas of expertise.
+        Focus on: key technical skills, experience relevance, notable achievements, and unique strengths.
         
         Be objective and base your summary on concrete evidence from the resume.
         
@@ -381,7 +467,7 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert recruiter providing objective candidate summaries. Return only valid JSON array."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.1,  # Very low temperature for consistency while maintaining some fluency
+                temperature=0.1,
                 max_tokens=800
             )
             
@@ -389,7 +475,7 @@ class AIScreeningService:
             content = re.sub(r'```json\n?|\n?```', '', content)
             
             summary_points = json.loads(content)
-            return summary_points[:4]  # Maximum 4 points
+            return summary_points[:4]
         
         except Exception as e:
             return [
@@ -403,9 +489,8 @@ class AIScreeningService:
         matched_skills: List[Dict],
         top_n: int = 6
     ) -> List[Dict[str, Any]]:
-        """Analyze proficiency depth for top skills - uses full resume text"""
+        """Analyze proficiency depth for top skills"""
         
-        # Get top skills that were found
         found_skills = [s for s in matched_skills if s["found_in_resume"]][:top_n]
         
         if not found_skills:
@@ -443,7 +528,7 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert at assessing technical skills objectively. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0,  # Zero temperature for consistency
+                temperature=0,
                 max_tokens=3000
             )
             
@@ -452,14 +537,12 @@ class AIScreeningService:
             
             result = json.loads(content)
             
-            # Ensure percentages are valid
             for item in result:
                 item["proficiency_percentage"] = min(100, max(0, item.get("proficiency_percentage", 50)))
             
             return result
         
         except Exception as e:
-            # Return default values
             return [
                 {
                     "skill_name": skill["skill"],
@@ -470,7 +553,7 @@ class AIScreeningService:
             ]
     
     async def _analyze_professional_summary(self, resume_text: str) -> Dict[str, Any]:
-        """Analyze professional summary including tenure, gaps, industry exposure - uses full resume"""
+        """Analyze professional summary including tenure, gaps, industry exposure"""
         
         prompt = f"""
         Analyze this resume and provide:
@@ -506,7 +589,7 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert at analyzing career histories. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0,  # Zero temperature for consistency
+                temperature=0,
                 max_tokens=1500
             )
             
@@ -515,7 +598,6 @@ class AIScreeningService:
             
             result = json.loads(content)
             
-            # Structure the response
             return {
                 "average_job_tenure": result.get("average_job_tenure", "Not specified"),
                 "tenure_assessment": result.get("tenure_assessment", "Moderate"),
@@ -534,7 +616,7 @@ class AIScreeningService:
             }
     
     async def _analyze_company_tiers(self, resume_text: str) -> Dict[str, int]:
-        """Analyze distribution of company tiers (Startup/Mid-size/Enterprise) - uses full resume"""
+        """Analyze distribution of company tiers"""
         
         prompt = f"""
         Analyze the companies mentioned in this resume and classify them into:
@@ -562,7 +644,7 @@ class AIScreeningService:
                     {"role": "system", "content": "You are an expert at analyzing companies. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0,  # Zero temperature for consistency
+                temperature=0,
                 max_tokens=400
             )
             
@@ -571,7 +653,6 @@ class AIScreeningService:
             
             result = json.loads(content)
             
-            # Ensure percentages sum to 100
             total = result.get("startup_percentage", 0) + result.get("mid_size_percentage", 0) + result.get("enterprise_percentage", 0)
             
             if total == 0:
@@ -581,7 +662,6 @@ class AIScreeningService:
                     "enterprise_percentage": 33
                 }
             
-            # Normalize to 100
             factor = 100 / total
             return {
                 "startup_percentage": int(result.get("startup_percentage", 0) * factor),

@@ -12,14 +12,10 @@ from datetime import datetime
 class UserRegister(BaseModel):
     """User registration request"""
     email: EmailStr = Field(..., description="User email address")
-    password: str = Field(
-        ..., 
-        min_length=8, 
-        max_length=72,  # Add max length for bcrypt compatibility
-        description="Password (8-72 characters)"
-    )
+    password: str = Field(..., min_length=8, description="Password (minimum 8 characters)")
     full_name: str = Field(..., min_length=2, description="Full name")
     company_name: Optional[str] = Field(None, description="Company name (optional)")
+
 
 class UserLogin(BaseModel):
     """User login request"""
@@ -48,38 +44,56 @@ class LoginResponse(BaseModel):
 
 # ==================== JOB DESCRIPTION MODELS ====================
 
+# ==================== JOB DESCRIPTION MODELS ====================
+
+class JobDescriptionRequest(BaseModel):
+    """Job description upload request - JSON body"""
+    screening_name: str = Field(..., description="Name/title for this screening")
+    job_description_file: Optional[str] = Field(
+        None, 
+        description="Base64 encoded file content (PDF or DOCX). Must include data URI prefix like 'data:application/pdf;base64,' or just the base64 string. Either this or description must be provided."
+    )
+    description: Optional[str] = Field(
+        None,
+        description="Manual job description text. Either this or job_description_file must be provided."
+    )
+
+
 class JobDescriptionResponse(BaseModel):
     """Job description upload response"""
     job_id: str = Field(..., description="Unique job ID")
     message: str
-    blob_url: str = Field(..., description="Azure Blob Storage URL for job description")
-    must_have_skills_count: int
-    nice_to_have_skills_count: int
+    blob_url: Optional[str] = Field(None, description="Azure Blob Storage URL for job description")
+    must_have_skills: List[str] = Field(..., description="Auto-extracted must-have technical skills")
+    nice_to_have_skills: List[str] = Field(..., description="Auto-extracted nice-to-have technical skills")
+
+# Add these models at the end of models.py
+
+# ==================== JOB LISTING & FILTER MODELS ====================
 
 class JobListingRequest(BaseModel):
     """Request model for job listing with filters"""
-    search: Optional[str] = Field(None, description="Search by screening name or job description")
+    search: Optional[str] = Field(None, description="Search term for screening_name or job_description_text")
     pageNumber: int = Field(1, ge=1, description="Page number (starts from 1)")
-    pageSize: int = Field(10, ge=1, le=100, description="Number of records per page")
-    sortBy: Optional[str] = Field("all", description="Filter by time: 'week', 'month', or 'all'")
+    pageSize: int = Field(10, ge=1, le=100, description="Number of items per page (max 100)")
+    sortBy: Optional[str] = Field(
+        "recent", 
+        description="Sort order: 'recent' (newest first), 'oldest', 'week' (last 7 days), 'month' (last 30 days), 'name' (alphabetical)"
+    )
 
 
 class JobListingResponse(BaseModel):
-    """Response model for job listing"""
+    """Response model for job listing with pagination"""
     total_jobs: int = Field(..., description="Total number of jobs matching filters")
     total_pages: int = Field(..., description="Total number of pages")
     current_page: int = Field(..., description="Current page number")
-    page_size: int = Field(..., description="Number of records per page")
-    jobs: List[Dict] = Field(..., description="List of jobs for current page")
-
+    page_size: int = Field(..., description="Number of items per page")
+    jobs: List[Dict] = Field(..., description="List of job descriptions")
 
 class FitScore(BaseModel):
     """Fit score details"""
     score: int = Field(..., ge=0, le=100, description="Overall fit score percentage")
-    weighted_skills_contributing: List[str] = Field(
-        default=[],
-        description="Skills that contributed more weightage to the score"
-    )
+    reasoning: str = Field(..., description="Brief explanation of the score")
 
 
 class MatchedSkill(BaseModel):
