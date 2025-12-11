@@ -33,6 +33,12 @@ from services.cosmos_db_service import CosmosDBService
 from services.auth_service import AuthService
 from config import settings
 
+from services.service_bus_service import ServiceBusService
+import uuid
+
+# Initialize service bus service
+service_bus_service = ServiceBusService()
+
 app = FastAPI(
     title="AI Resume Screener API",
     description="Intelligent resume screening system with Azure OpenAI and User Authentication",
@@ -516,6 +522,285 @@ async def upload_job_description(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+'''@app.post("/api/upload-resumes")
+async def upload_resumes_for_processing(
+    request: ResumeScreeningRequest,
+    current_user: Dict = Depends(get_current_user)
+):
+    """
+    Upload resumes to blob storage (or use existing blob URLs) and queue them for processing
+    
+    Two modes:
+    1. Upload Mode: Provide base64 resumes in 'resumes' field
+    2. Blob URL Mode: Provide blob URLs in 'blob_urls' field
+    
+    Example Request (Blob URL Mode):
+    {
+        "job_id": "abc-123",
+        "blob_urls": [
+            {
+                "blob_url": "https://mystorageaccount.blob.core.windows.net/resumes/resume1.pdf",
+                "filename": "john_doe_resume.pdf"
+            },
+            {
+                "blob_url": "https://mystorageaccount.blob.core.windows.net/resumes/resume2.pdf",
+                "filename": "jane_smith_resume.pdf"
+            }
+        ]
+    }
+    
+    Example Request (Upload Mode):
+    {
+        "job_id": "abc-123",
+        "resumes": [
+            {
+                "resume_file": "data:application/pdf;base64,JVBERi0...",
+                "filename": "resume.pdf"
+            }
+        ]
+    }
+    """
+    try:
+        # Validate input
+        if not request.resumes and not request.blob_urls:
+            raise HTTPException(
+                status_code=400,
+                detail="Either 'resumes' (base64) or 'blob_urls' must be provided"
+            )
+        
+        if request.resumes and request.blob_urls:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either 'resumes' OR 'blob_urls', not both"
+            )
+        
+        # Verify job exists
+        job_data = await cosmos_service.get_job_description(request.job_id, current_user["user_id"])
+        if not job_data:
+            raise HTTPException(
+                status_code=404,
+                detail="Job description not found or access denied"
+            )
+        
+        # Generate unique screening job ID
+        screening_job_id = str(uuid.uuid4())
+        
+        # Determine total resumes
+        total_resumes = len(request.resumes) if request.resumes else len(request.blob_urls)
+        
+        if total_resumes > settings.MAX_RESUMES_PER_BATCH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum {settings.MAX_RESUMES_PER_BATCH} resumes allowed per batch"
+            )
+        
+        print(f" Starting processing of {total_resumes} resume(s) for screening job: {screening_job_id}")
+        
+        # Create screening job entry
+        await cosmos_service.create_screening_job(
+            screening_job_id=screening_job_id,
+            job_id=request.job_id,
+            user_id=current_user["user_id"],
+            total_resumes=total_resumes
+        )
+        
+        queued_count = 0
+        failed_uploads = []
+        
+        # MODE 1: Process blob URLs directly (Frontend uploaded)
+        if request.blob_urls:
+            print(f"📎 Processing {len(request.blob_urls)} existing blob URLs...")
+            
+            for idx, blob_data in enumerate(request.blob_urls, 1):
+                try:
+                    blob_url = blob_data.get("blob_url")
+                    filename = blob_data.get("filename", f"resume_{idx}.pdf")
+                    
+                    if not blob_url:
+                        raise ValueError("blob_url is required")
+                    
+                    # Validate blob URL format
+                    if "blob.core.windows.net" not in blob_url:
+                        raise ValueError("Invalid Azure Blob URL")
+                    
+                    # Send directly to Service Bus queue
+                    await service_bus_service.send_resume_for_processing(
+                        screening_job_id=screening_job_id,
+                        job_id=request.job_id,
+                        user_id=current_user["user_id"],
+                        resume_blob_url=blob_url,
+                        resume_filename=filename
+                    )
+                    
+                    queued_count += 1
+                    print(f" Queued blob URL: {filename} ({queued_count}/{total_resumes})")
+                
+                except Exception as e:
+                    print(f" Failed to queue blob URL {idx}: {str(e)}")
+                    failed_uploads.append({
+                        "index": idx,
+                        "blob_url": blob_data.get("blob_url"),
+                        "error": str(e)
+                    })
+        
+        # MODE 2: Upload base64 resumes (Original flow)
+        elif request.resumes:
+            print(f" Uploading {len(request.resumes)} base64 resumes...")
+            
+            for idx, resume_data in enumerate(request.resumes, 1):
+                try:
+                    # Extract base64 and file info
+                    base64_data = resume_data.resume_file
+                    filename = resume_data.filename
+                    
+                    # Detect file type
+                    if base64_data.startswith('data:'):
+                        header, encoded = base64_data.split(',', 1)
+                        mime_type = header.split(':')[1].split(';')[0]
+                        base64_data = encoded
+                        
+                        if 'pdf' in mime_type.lower():
+                            file_extension = '.pdf'
+                            content_type = 'application/pdf'
+                        elif 'word' in mime_type.lower() or 'document' in mime_type.lower():
+                            file_extension = '.docx'
+                            content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                        else:
+                            raise ValueError(f"Unsupported MIME type: {mime_type}")
+                    else:
+                        # Detect from content
+                        decoded_preview = base64.b64decode(base64_data[:100])
+                        if decoded_preview.startswith(b'%PDF'):
+                            file_extension = '.pdf'
+                            content_type = 'application/pdf'
+                        elif decoded_preview.startswith(b'PK\x03\x04'):
+                            file_extension = '.docx'
+                            content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                        else:
+                            raise ValueError("Unable to detect file type")
+                    
+                    # Generate filename
+                    if not filename:
+                        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                        filename = f"resume_{timestamp}_{idx}{file_extension}"
+                    elif not filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                        filename = f"{filename}{file_extension}"
+                    
+                    # Decode base64
+                    resume_content = base64.b64decode(base64_data)
+                    
+                    # Validate size
+                    file_size_mb = len(resume_content) / (1024 * 1024)
+                    if file_size_mb > settings.MAX_FILE_SIZE_MB:
+                        raise ValueError(f"File size ({file_size_mb:.2f}MB) exceeds limit")
+                    
+                    # Upload to blob storage
+                    blob_path = f"resumes/{screening_job_id}/{current_user['user_id']}/{filename}"
+                    resume_blob_url = await blob_service.upload_file(
+                        resume_content,
+                        blob_path,
+                        content_type=content_type
+                    )
+                    
+                    # Send to Service Bus queue
+                    await service_bus_service.send_resume_for_processing(
+                        screening_job_id=screening_job_id,
+                        job_id=request.job_id,
+                        user_id=current_user["user_id"],
+                        resume_blob_url=resume_blob_url,
+                        resume_filename=filename
+                    )
+                    
+                    queued_count += 1
+                    print(f" Uploaded and queued: {filename} ({queued_count}/{total_resumes})")
+                
+                except Exception as e:
+                    print(f" Failed to upload resume {idx}: {str(e)}")
+                    failed_uploads.append({
+                        "index": idx,
+                        "filename": filename if filename else "unknown",
+                        "error": str(e)
+                    })
+        
+        if queued_count == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to queue any resumes for processing"
+            )
+        
+        print(f" Complete: {queued_count}/{total_resumes} resumes queued for processing")
+        
+        return {
+            "screening_job_id": screening_job_id,
+            "job_id": request.job_id,
+            "total_resumes": queued_count,
+            "failed_uploads": failed_uploads if failed_uploads else None,
+            "message": f" {queued_count} resume(s) queued for processing.",
+            "status": "processing",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in upload_resumes_for_processing: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))'''
+
+
+# Update the status endpoint in main.py
+
+@app.get("/api/screening-status/{job_id}")
+async def get_screening_status(
+    job_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """
+    Get current status and progress of resume screening for a job (for polling)
+    
+    Frontend should call this endpoint every 5 seconds to check progress
+    
+    Args:
+        job_id: Job ID (the job description ID)
+        current_user: Authenticated user
+    
+    Returns:
+        {
+            "job_id": "job-456-789",
+            "status": "processing",  // "no_resumes", "processing", "completed"
+            "total_resumes": 5,
+            "processed_resumes": 2,
+            "successful_resumes": 2,
+            "failed_resumes": 0,
+            "progress_percentage": 40,
+            "completed_results": [
+                {candidate_report_1},
+                {candidate_report_2}
+            ]
+        }
+    """
+    try:
+        status_data = await cosmos_service.get_screening_job_status_by_job_id(
+            job_id,
+            current_user["user_id"]
+        )
+        
+        if not status_data:
+            raise HTTPException(
+                status_code=404,
+                detail="Job not found or access denied"
+            )
+        
+        return status_data
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in get_screening_status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Remove the old /api/upload-resumes endpoint - it's not needed anymore!
+    
 @app.post("/api/screen-resumes", response_model=ResumeScreeningResponse)
 async def screen_resumes(
     request: ResumeScreeningRequest,
@@ -743,8 +1028,8 @@ async def screen_resumes(
         # Calculate total processing time
         total_processing_time = time.time() - start_time
         
-        print(f"✅ Successfully processed {len(candidate_reports)}/{len(request.resumes)} resume(s) in {total_processing_time:.2f} seconds")
-        print(f"📊 Average time per resume: {total_processing_time/len(candidate_reports):.2f} seconds")
+        print(f" Successfully processed {len(candidate_reports)}/{len(request.resumes)} resume(s) in {total_processing_time:.2f} seconds")
+        print(f" Average time per resume: {total_processing_time/len(candidate_reports):.2f} seconds")
         
         return ResumeScreeningResponse(
             job_id=request.job_id,

@@ -28,3 +28,7 @@ passlib
 jose
 
 bcrypt
+
+azure-servicebus 
+azure-storage-blob 
+azure-eventgrid

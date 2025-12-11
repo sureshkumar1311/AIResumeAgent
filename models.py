@@ -242,9 +242,17 @@ class ResumeBase64(BaseModel):
 
 
 class ResumeScreeningRequest(BaseModel):
-    """Request model for screening resumes with base64"""
+    """Request model for screening resumes"""
     job_id: str = Field(..., description="Job ID to screen resumes against")
-    resumes: List[ResumeBase64] = Field(..., min_items=1, description="List of resumes in base64 format")
+    resumes: List[ResumeBase64] = Field(
+        None, 
+        min_items=1, 
+        description="List of resumes in base64 format (optional if blob_urls provided)"
+    )
+    blob_urls: List[Dict[str, str]] = Field(
+        None,
+        description="List of {blob_url, filename} for already-uploaded resumes (optional if resumes provided)"
+    )
 
 class ResumeScreeningResponse(BaseModel):
     """Response for resume screening endpoint"""

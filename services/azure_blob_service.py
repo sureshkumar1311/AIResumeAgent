@@ -7,6 +7,7 @@ from config import settings
 from typing import Optional
 import uuid
 from datetime import datetime, timedelta
+import re
 
 
 class AzureBlobService:
@@ -106,29 +107,48 @@ class AzureBlobService:
     
     async def download_file(self, blob_url: str) -> bytes:
         """
-        Download file from blob storage
+        Download file from blob storage using direct URL
         
         Args:
-            blob_url: URL of the blob
+            blob_url: Complete blob URL (e.g., https://account.blob.core.windows.net/container/path/file.pdf)
         
         Returns:
             File content as bytes
         """
         try:
-            # Parse container and blob name from URL
-            parts = blob_url.split('/')
-            container_name = parts[-2]
-            blob_name = parts[-1]
+            # Parse the blob URL to extract container and blob path
+            # URL format: https://{account}.blob.core.windows.net/{container}/{blob_path}
             
-            # Get blob client
+            # Remove query parameters (SAS token) if present
+            clean_url = blob_url.split('?')[0]
+            
+            # Parse URL
+            # Example: https://airesumeagentblob.blob.core.windows.net/resume-eventgrid/job-id/file.pdf
+            match = re.match(r'https://([^.]+)\.blob\.core\.windows\.net/([^/]+)/(.+)$', clean_url)
+            
+            if not match:
+                raise ValueError(f"Invalid blob URL format: {blob_url}")
+            
+            account_name = match.group(1)
+            container_name = match.group(2)
+            blob_path = match.group(3)
+            
+            print(f"      Downloading from:")
+            print(f"         Account: {account_name}")
+            print(f"         Container: {container_name}")
+            print(f"         Blob Path: {blob_path}")
+            
+            # Get blob client using the parsed information
             blob_client = self.blob_service_client.get_blob_client(
                 container=container_name,
-                blob=blob_name
+                blob=blob_path
             )
             
             # Download blob
             download_stream = blob_client.download_blob()
-            return download_stream.readall()
+            content = download_stream.readall()
+            
+            return content
         
         except Exception as e:
             raise Exception(f"Failed to download file from blob storage: {str(e)}")
@@ -144,15 +164,20 @@ class AzureBlobService:
             True if deleted successfully
         """
         try:
-            # Parse container and blob name from URL
-            parts = blob_url.split('/')
-            container_name = parts[-2]
-            blob_name = parts[-1]
+            # Parse blob URL
+            clean_url = blob_url.split('?')[0]
+            match = re.match(r'https://([^.]+)\.blob\.core\.windows\.net/([^/]+)/(.+)$', clean_url)
+            
+            if not match:
+                raise ValueError(f"Invalid blob URL format: {blob_url}")
+            
+            container_name = match.group(2)
+            blob_path = match.group(3)
             
             # Get blob client
             blob_client = self.blob_service_client.get_blob_client(
                 container=container_name,
-                blob=blob_name
+                blob=blob_path
             )
             
             # Delete blob
@@ -181,22 +206,27 @@ class AzureBlobService:
         try:
             from azure.storage.blob import generate_blob_sas, BlobSasPermissions
             
-            # Parse container and blob name from URL
-            parts = blob_url.split('/')
-            container_name = parts[-2]
-            blob_name = parts[-1]
+            # Parse blob URL
+            clean_url = blob_url.split('?')[0]
+            match = re.match(r'https://([^.]+)\.blob\.core\.windows\.net/([^/]+)/(.+)$', clean_url)
+            
+            if not match:
+                raise ValueError(f"Invalid blob URL format: {blob_url}")
+            
+            container_name = match.group(2)
+            blob_path = match.group(3)
             
             # Generate SAS token
             sas_token = generate_blob_sas(
                 account_name=self.blob_service_client.account_name,
                 container_name=container_name,
-                blob_name=blob_name,
-                account_key=settings.AZURE_STORAGE_CONNECTION_STRING.split('AccountKey=')[1].split(';')[0],
+                blob_name=blob_path,
+                account_key=self._get_account_key(),
                 permission=BlobSasPermissions(read=True),
                 expiry=datetime.utcnow() + timedelta(hours=expiry_hours)
             )
             
-            return f"{blob_url}?{sas_token}"
+            return f"{clean_url}?{sas_token}"
         
         except Exception as e:
             raise Exception(f"Failed to generate SAS URL: {str(e)}")

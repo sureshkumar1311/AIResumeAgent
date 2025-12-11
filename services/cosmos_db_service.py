@@ -33,24 +33,22 @@ class CosmosDBService:
             )
             
             # Create jobs container if not exists
+            # REMOVED offer_throughput for serverless compatibility
             self.jobs_container = self.database.create_container_if_not_exists(
                 id=settings.COSMOS_DB_CONTAINER_JOBS,
-                partition_key=PartitionKey(path="/user_id"),
-                offer_throughput=400
+                partition_key=PartitionKey(path="/user_id")
             )
             
             # Create screenings container if not exists
             self.screenings_container = self.database.create_container_if_not_exists(
                 id=settings.COSMOS_DB_CONTAINER_SCREENINGS,
-                partition_key=PartitionKey(path="/job_id"),
-                offer_throughput=400
+                partition_key=PartitionKey(path="/job_id")
             )
             
             # Create users container if not exists
             self.users_container = self.database.create_container_if_not_exists(
                 id=settings.COSMOS_DB_CONTAINER_USERS,
-                partition_key=PartitionKey(path="/user_id"),
-                offer_throughput=400
+                partition_key=PartitionKey(path="/user_id")
             )
         
         except Exception as e:
@@ -272,6 +270,188 @@ class CosmosDBService:
         
         except Exception as e:
             print(f"Failed to update screening count: {str(e)}")
+
+    async def create_screening_job(
+        self,
+        screening_job_id: str,
+        job_id: str,
+        user_id: str,
+        total_resumes: int
+    ) -> str:
+        """
+        Create a screening job entry to track batch progress
+        
+        Args:
+            screening_job_id: Unique screening job ID
+            job_id: Job description ID
+            user_id: User ID
+            total_resumes: Total number of resumes to process
+        
+        Returns:
+            Screening job ID
+        """
+        try:
+            # Create screening_jobs container if not exists
+            if not hasattr(self, 'screening_jobs_container'):
+                self.screening_jobs_container = self.database.create_container_if_not_exists(
+                    id=settings.COSMOS_DB_CONTAINER_SCREENING_JOBS,
+                    partition_key=PartitionKey(path="/user_id"),
+                    offer_throughput=400
+                )
+            
+            screening_job_data = {
+                "id": screening_job_id,
+                "screening_job_id": screening_job_id,
+                "job_id": job_id,
+                "user_id": user_id,
+                "total_resumes": total_resumes,
+                "processed_resumes": 0,
+                "successful_resumes": 0,
+                "failed_resumes": 0,
+                "status": "processing",  # processing, completed, failed
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+                "resume_statuses": []  # List of {filename, status, processed_at}
+            }
+            
+            self.screening_jobs_container.create_item(body=screening_job_data)
+            return screening_job_id
+        
+        except Exception as e:
+            raise Exception(f"Failed to create screening job: {str(e)}")
+        
+    async def get_screening_job(self, screening_job_id: str) -> Optional[Dict[str, Any]]:
+        """Get screening job by ID"""
+        try:
+            if not hasattr(self, 'screening_jobs_container'):
+                return None
+            
+            query = "SELECT * FROM c WHERE c.screening_job_id = @screening_job_id"
+            parameters = [{"name": "@screening_job_id", "value": screening_job_id}]
+            
+            items = list(self.screening_jobs_container.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            ))
+            
+            return items[0] if items else None
+        
+        except Exception as e:
+            print(f"Error getting screening job: {str(e)}")
+            return None
+        
+    async def get_screening_job_status(
+        self,
+        screening_job_id: str,
+        user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get current status of a screening job (for polling)
+        
+        Args:
+            screening_job_id: Screening job ID
+            user_id: User ID (for authorization)
+        
+        Returns:
+            Status dictionary with progress information
+        """
+        try:
+            screening_job = await self.get_screening_job(screening_job_id)
+            
+            if not screening_job or screening_job.get("user_id") != user_id:
+                return None
+            
+            # Get completed screening results
+            completed_screenings = await self.get_screening_results(
+                job_id=screening_job["job_id"]
+            )
+            
+            # Filter only screenings from this batch (if needed)
+            # For now, return all recent ones
+            
+            return {
+                "screening_job_id": screening_job_id,
+                "status": screening_job["status"],
+                "total_resumes": screening_job["total_resumes"],
+                "processed_resumes": screening_job["processed_resumes"],
+                "successful_resumes": screening_job["successful_resumes"],
+                "failed_resumes": screening_job["failed_resumes"],
+                "progress_percentage": screening_job.get("progress_percentage", 0),
+                "created_at": screening_job["created_at"],
+                "updated_at": screening_job["updated_at"],
+                "completed_results": completed_screenings[-screening_job["processed_resumes"]:] if completed_screenings else []
+            }
+        
+        except Exception as e:
+            print(f"Error getting screening job status: {str(e)}")
+            return None
+        
+    async def update_screening_job_progress(
+        self,
+        screening_job_id: str,
+        resume_filename: str,
+        status: str,  # "success" or "failed"
+        screening_id: Optional[str] = None
+    ) -> bool:
+        """
+        Update progress of a screening job after processing one resume
+        
+        Args:
+            screening_job_id: Screening job ID
+            resume_filename: Name of the processed resume
+            status: "success" or "failed"
+            screening_id: Optional screening result ID
+        
+        Returns:
+            True if updated successfully
+        """
+        try:
+            if not hasattr(self, 'screening_jobs_container'):
+                return False
+            
+            # Get current screening job
+            screening_job = await self.get_screening_job(screening_job_id)
+            if not screening_job:
+                return False
+            
+            # Update counters
+            screening_job["processed_resumes"] += 1
+            
+            if status == "success":
+                screening_job["successful_resumes"] += 1
+            else:
+                screening_job["failed_resumes"] += 1
+            
+            # Add resume status
+            screening_job["resume_statuses"].append({
+                "filename": resume_filename,
+                "status": status,
+                "processed_at": datetime.utcnow().isoformat(),
+                "screening_id": screening_id
+            })
+            
+            # Update overall status
+            if screening_job["processed_resumes"] >= screening_job["total_resumes"]:
+                screening_job["status"] = "completed"
+            
+            screening_job["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Calculate progress percentage
+            screening_job["progress_percentage"] = int(
+                (screening_job["processed_resumes"] / screening_job["total_resumes"]) * 100
+            )
+            
+            # Update in database
+            self.screening_jobs_container.upsert_item(body=screening_job)
+            
+            print(f" Progress: {screening_job['processed_resumes']}/{screening_job['total_resumes']} ({screening_job['progress_percentage']}%)")
+            
+            return True
+        
+        except Exception as e:
+            print(f"Error updating screening job progress: {str(e)}")
+            return False
     
     async def save_screening_result(
         self,
@@ -701,3 +881,343 @@ class CosmosDBService:
         
         except Exception as e:
             raise Exception(f"Failed to get user statistics: {str(e)}")
+        
+    # Add these methods to the existing CosmosDBService class
+
+    async def get_screening_job_by_job_id(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get screening job by job_id
+        
+        Args:
+            job_id: Job description ID
+        
+        Returns:
+            Screening job data or None
+        """
+        try:
+            # Initialize container if needed
+            if not hasattr(self, 'screening_jobs_container'):
+                try:
+                    self.screening_jobs_container = self.database.get_container_client(
+                        settings.COSMOS_DB_CONTAINER_SCREENING_JOBS
+                    )
+                except:
+                    # Container doesn't exist yet
+                    return None
+            
+            # Try to read item directly using job_id as both id and partition key
+            try:
+                item = self.screening_jobs_container.read_item(
+                    item=job_id,
+                    partition_key=job_id
+                )
+                return item
+            except exceptions.CosmosResourceNotFoundError:
+                # Item doesn't exist
+                return None
+        
+        except Exception as e:
+            print(f"Error getting screening job: {str(e)}")
+            return None
+
+
+    async def initialize_screening_job_for_job(
+        self,
+        job_id: str,
+        user_id: str
+    ) -> bool:
+        """
+        Initialize screening job tracking for a job_id
+        """
+        try:
+            # Check if screening job already exists
+            existing = await self.get_screening_job_by_job_id(job_id)
+            if existing:
+                print(f"        Screening job already exists")
+                return True
+            
+            # Create screening_jobs container if not exists
+            if not hasattr(self, 'screening_jobs_container'):
+                self.screening_jobs_container = self.database.create_container_if_not_exists(
+                    id=settings.COSMOS_DB_CONTAINER_SCREENING_JOBS,
+                    partition_key=PartitionKey(path="/job_id")
+                )
+            
+            screening_job_data = {
+                "id": job_id,
+                "job_id": job_id,  # This must match id for partition key
+                "user_id": user_id,
+                "total_resumes": 0,
+                "processed_resumes": 0,
+                "successful_resumes": 0,
+                "failed_resumes": 0,
+                "status": "processing",
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+                "resume_statuses": []
+            }
+            
+            try:
+                self.screening_jobs_container.create_item(body=screening_job_data)
+                print(f"       Initialized screening job for job_id: {job_id}")
+                return True
+            except exceptions.CosmosResourceExistsError:
+                # Another worker already created it (race condition)
+                print(f"        Screening job created by another worker")
+                return True
+        
+        except Exception as e:
+            print(f"Error initializing screening job: {str(e)}")
+            # Don't fail the whole process, just continue
+            return True
+
+
+    '''async def increment_total_resumes(self, job_id: str) -> bool:
+        """
+        Increment total resumes counter when new resume is detected
+        """
+        try:
+            screening_job = await self.get_screening_job_by_job_id(job_id)
+            if not screening_job:
+                print(f"        Screening job not found, skipping increment")
+                return False
+            
+            screening_job["total_resumes"] += 1
+            screening_job["updated_at"] = datetime.utcnow().isoformat()
+            
+            if not hasattr(self, 'screening_jobs_container'):
+                self.screening_jobs_container = self.database.get_container_client(
+                    settings.COSMOS_DB_CONTAINER_SCREENING_JOBS
+                )
+            
+            self.screening_jobs_container.upsert_item(body=screening_job)
+            print(f"       Total resumes: {screening_job['total_resumes']}")
+            return True
+        
+        except Exception as e:
+            print(f"Error incrementing total resumes: {str(e)}")
+            return False'''
+
+
+    async def update_screening_job_progress_by_job_id(
+        self,
+        job_id: str,
+        resume_filename: str,
+        status: str,
+        screening_id: Optional[str] = None
+    ) -> bool:
+        """
+        Update progress of a screening job after processing one resume
+        """
+        try:
+            # Get screening job
+            screening_job = await self.get_screening_job_by_job_id(job_id)
+            if not screening_job:
+                print(f"        Screening job not found for progress update")
+                return False
+            
+            # Update counters
+            screening_job["processed_resumes"] += 1
+            
+            if status == "success":
+                screening_job["successful_resumes"] += 1
+            else:
+                screening_job["failed_resumes"] += 1
+            
+            # Add resume status
+            screening_job["resume_statuses"].append({
+                "filename": resume_filename,
+                "status": status,
+                "processed_at": datetime.utcnow().isoformat(),
+                "screening_id": screening_id
+            })
+            
+            # Update overall status
+            if screening_job["processed_resumes"] >= screening_job["total_resumes"]:
+                screening_job["status"] = "completed"
+            
+            screening_job["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Calculate progress percentage
+            if screening_job["total_resumes"] > 0:
+                screening_job["progress_percentage"] = int(
+                    (screening_job["processed_resumes"] / screening_job["total_resumes"]) * 100
+                )
+            else:
+                screening_job["progress_percentage"] = 0
+            
+            # Ensure container is available
+            if not hasattr(self, 'screening_jobs_container'):
+                self.screening_jobs_container = self.database.get_container_client(
+                    settings.COSMOS_DB_CONTAINER_SCREENING_JOBS
+                )
+            
+            # Update in database
+            self.screening_jobs_container.upsert_item(body=screening_job)
+            
+            print(f" Progress for job {job_id}: {screening_job['processed_resumes']}/{screening_job['total_resumes']} ({screening_job['progress_percentage']}%)")
+            
+            return True
+        
+        except Exception as e:
+            print(f"Error updating screening job progress: {str(e)}")
+            return False
+
+    # Add this method to CosmosDBService class
+
+    async def is_resume_already_processed(self, job_id: str, resume_filename: str) -> bool:
+        """
+        Check if resume has already been processed (prevents duplicates)
+        
+        Args:
+            job_id: Job ID
+            resume_filename: Resume filename
+        
+        Returns:
+            True if already processed, False otherwise
+        """
+        try:
+            if not hasattr(self, 'screenings_container'):
+                return False
+            
+            # Query to check if this resume was already processed
+            query = "SELECT VALUE COUNT(1) FROM c WHERE c.job_id = @job_id AND c.resume_filename = @filename"
+            parameters = [
+                {"name": "@job_id", "value": job_id},
+                {"name": "@filename", "value": resume_filename}
+            ]
+            
+            result = list(self.screenings_container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=job_id
+            ))
+            
+            count = result[0] if result else 0
+            return count > 0
+        
+        except Exception as e:
+            print(f"Error checking duplicate: {str(e)}")
+            return False
+
+
+    async def get_total_resumes_in_blob(self, job_id: str) -> int:
+        """
+        Count total resumes uploaded in blob storage for a job
+        
+        Args:
+            job_id: Job ID
+        
+        Returns:
+            Total count of resume files in blob storage
+        """
+        try:
+            from azure.storage.blob import BlobServiceClient
+            
+            # Initialize blob client
+            blob_service_client = BlobServiceClient.from_connection_string(
+                settings.AZURE_STORAGE_CONNECTION_STRING
+            )
+            
+            container_client = blob_service_client.get_container_client(
+                settings.AZURE_STORAGE_CONTAINER_RESUMES
+            )
+            
+            # List all blobs with job_id prefix
+            blob_prefix = f"{job_id}/"
+            blobs = container_client.list_blobs(name_starts_with=blob_prefix)
+            
+            # Count blobs (excluding folders)
+            count = sum(1 for blob in blobs if not blob.name.endswith('/'))
+            
+            return count
+        
+        except Exception as e:
+            print(f"Error counting blobs: {str(e)}")
+            return 0
+
+
+    async def get_screening_job_status_by_job_id(
+        self,
+        job_id: str,
+        user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get current status of a screening job by job_id (for polling)
+         UPDATED: Shows total_resumes immediately from blob storage
+        """
+        try:
+            # Verify job belongs to user
+            job_data = await self.get_job_description(job_id, user_id)
+            if not job_data:
+                return None
+            
+            #  Get total resumes from BLOB STORAGE (not from tracker)
+            total_resumes_in_blob = await self.get_total_resumes_in_blob(job_id)
+            
+            # Get screening job tracker
+            screening_job = await self.get_screening_job_by_job_id(job_id)
+            
+            if not screening_job:
+                # No processing started yet, but show total from blob
+                if total_resumes_in_blob > 0:
+                    # Files uploaded but not processed yet
+                    return {
+                        "job_id": job_id,
+                        "status": "pending",  # New status
+                        "total_resumes": total_resumes_in_blob,
+                        "processed_resumes": 0,
+                        "successful_resumes": 0,
+                        "failed_resumes": 0,
+                        "progress_percentage": 0,
+                        "completed_results": []
+                    }
+                else:
+                    # No files uploaded
+                    return {
+                        "job_id": job_id,
+                        "status": "no_resumes",
+                        "total_resumes": 0,
+                        "processed_resumes": 0,
+                        "successful_resumes": 0,
+                        "failed_resumes": 0,
+                        "progress_percentage": 0,
+                        "completed_results": []
+                    }
+            
+            # Get completed screening results
+            completed_screenings = await self.get_screening_results(job_id)
+            
+            #  Use blob count as source of truth for total
+            processed_resumes = screening_job["processed_resumes"]
+            
+            # Calculate progress
+            if total_resumes_in_blob > 0:
+                progress_percentage = int((processed_resumes / total_resumes_in_blob) * 100)
+            else:
+                progress_percentage = 0
+            
+            # Determine status
+            if processed_resumes >= total_resumes_in_blob and total_resumes_in_blob > 0:
+                status = "completed"
+            elif processed_resumes > 0:
+                status = "processing"
+            else:
+                status = "pending"
+            
+            return {
+                "job_id": job_id,
+                "status": status,
+                "total_resumes": total_resumes_in_blob,  #  From blob storage
+                "processed_resumes": processed_resumes,
+                "successful_resumes": screening_job.get("successful_resumes", 0),
+                "failed_resumes": screening_job.get("failed_resumes", 0),
+                "progress_percentage": progress_percentage,
+                "created_at": screening_job.get("created_at"),
+                "updated_at": screening_job.get("updated_at"),
+                "completed_results": completed_screenings
+            }
+        
+        except Exception as e:
+            print(f"Error getting screening job status: {str(e)}")
+            return None

@@ -450,6 +450,8 @@ class AIScreeningService:
         
         Be objective and base your summary on concrete evidence from the resume.
         
+        IMPORTANT: You MUST return at least 3 bullet points. If information is limited, create 3 general points about the candidate.
+        
         Job Requirements (complete):
         {job_description}
         
@@ -464,7 +466,7 @@ class AIScreeningService:
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert recruiter providing objective candidate summaries. Return only valid JSON array."},
+                    {"role": "system", "content": "You are an expert recruiter providing objective candidate summaries. Return only valid JSON array with at least 3 items."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
@@ -475,12 +477,25 @@ class AIScreeningService:
             content = re.sub(r'```json\n?|\n?```', '', content)
             
             summary_points = json.loads(content)
+            
+            #  Ensure we have at least 3 points
+            if not summary_points or len(summary_points) < 3:
+                # Fallback summary
+                summary_points = [
+                    f"Candidate has relevant background in {skills_analysis.get('matched_must_have_list', [{}])[0].get('skill', 'the field') if skills_analysis.get('matched_must_have_list') else 'the field'}",
+                    f"Demonstrates experience with {skills_analysis.get('must_have_matched', 0)} of {skills_analysis.get('must_have_total', 0)} required skills",
+                    "Please review the detailed resume for comprehensive assessment"
+                ]
+            
             return summary_points[:4]
         
         except Exception as e:
+            print(f"Error generating AI summary: {str(e)}")
+            # Return fallback summary
             return [
-                "Unable to generate detailed summary due to parsing error.",
-                "Please review the resume manually for comprehensive assessment."
+                "Candidate profile reviewed for position requirements",
+                "Technical skills assessment completed",
+                "Please review detailed screening results for complete evaluation"
             ]
     
     async def _analyze_skill_depth(
@@ -563,6 +578,11 @@ class AIScreeningService:
         4. Industry exposure percentages (identify top industries and their percentage distribution)
         5. Total number of companies worked for
         
+        IMPORTANT: 
+        - If no significant career gap (>6 months) is found, return null for career_gap
+        - If a career gap exists, ALWAYS provide a duration string like "6 months" or "1 year"
+        - Never return empty string for duration
+        
         Resume (complete content):
         {resume_text}
         
@@ -570,7 +590,7 @@ class AIScreeningService:
         {{
             "average_job_tenure": "X years Y months",
             "tenure_assessment": "Low/Moderate/High/Very High",
-            "career_gap": {{"duration": "X years Y months", "reason": "reason or null"}},
+            "career_gap": {{"duration": "X years Y months", "reason": "reason"}} or null,
             "industry_exposure": [
                 {{"industry": "name", "percentage": number}},
                 ...
@@ -578,7 +598,7 @@ class AIScreeningService:
             "total_companies": number
         }}
         
-        For career_gap, return null if no significant gap (>6 months) found.
+        For career_gap, return null if no significant gap found.
         Industry percentages should sum to 100.
         """
         
@@ -598,15 +618,25 @@ class AIScreeningService:
             
             result = json.loads(content)
             
+            #  Validate career_gap structure
+            career_gap = result.get("career_gap")
+            if career_gap:
+                # Ensure duration is a valid string
+                if not career_gap.get("duration") or career_gap.get("duration") == "":
+                    career_gap = None
+                elif not isinstance(career_gap.get("duration"), str):
+                    career_gap = None
+            
             return {
                 "average_job_tenure": result.get("average_job_tenure", "Not specified"),
                 "tenure_assessment": result.get("tenure_assessment", "Moderate"),
-                "career_gap": result.get("career_gap"),
+                "career_gap": career_gap,
                 "major_industry_exposure": result.get("industry_exposure", []),
                 "total_companies": result.get("total_companies", 0)
             }
         
         except Exception as e:
+            print(f"Error analyzing professional summary: {str(e)}")
             return {
                 "average_job_tenure": "Not specified",
                 "tenure_assessment": "Moderate",

@@ -111,3 +111,6 @@ node_modules/
 htmlcov/
 
 zip.zip
+tst.py
+worker.py
+test_resumes.py
