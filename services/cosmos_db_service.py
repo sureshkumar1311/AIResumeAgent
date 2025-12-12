@@ -928,26 +928,35 @@ class CosmosDBService:
     ) -> bool:
         """
         Initialize screening job tracking for a job_id
+        FIXED: Ensure container exists and handle conflicts properly
         """
         try:
+            # Ensure container exists
+            if not hasattr(self, 'screening_jobs_container'):
+                try:
+                    # Try to get existing container first
+                    self.screening_jobs_container = self.database.get_container_client(
+                        settings.COSMOS_DB_CONTAINER_SCREENING_JOBS
+                    )
+                except:
+                    # Container doesn't exist, create it
+                    self.screening_jobs_container = self.database.create_container_if_not_exists(
+                        id=settings.COSMOS_DB_CONTAINER_SCREENING_JOBS,
+                        partition_key=PartitionKey(path="/job_id")
+                    )
+            
             # Check if screening job already exists
             existing = await self.get_screening_job_by_job_id(job_id)
             if existing:
-                print(f"        Screening job already exists")
+                print(f"        Screening job already exists for job_id: {job_id}")
                 return True
             
-            # Create screening_jobs container if not exists
-            if not hasattr(self, 'screening_jobs_container'):
-                self.screening_jobs_container = self.database.create_container_if_not_exists(
-                    id=settings.COSMOS_DB_CONTAINER_SCREENING_JOBS,
-                    partition_key=PartitionKey(path="/job_id")
-                )
-            
+            # Create new screening job
             screening_job_data = {
                 "id": job_id,
-                "job_id": job_id,  # This must match id for partition key
+                "job_id": job_id,
                 "user_id": user_id,
-                "total_resumes": 0,
+                "total_resumes": 0,  # Will be calculated from blob
                 "processed_resumes": 0,
                 "successful_resumes": 0,
                 "failed_resumes": 0,
@@ -959,7 +968,7 @@ class CosmosDBService:
             
             try:
                 self.screening_jobs_container.create_item(body=screening_job_data)
-                print(f"       Initialized screening job for job_id: {job_id}")
+                print(f"       Created screening job tracker for job_id: {job_id}")
                 return True
             except exceptions.CosmosResourceExistsError:
                 # Another worker already created it (race condition)
@@ -967,36 +976,10 @@ class CosmosDBService:
                 return True
         
         except Exception as e:
-            print(f"Error initializing screening job: {str(e)}")
-            # Don't fail the whole process, just continue
-            return True
-
-
-    '''async def increment_total_resumes(self, job_id: str) -> bool:
-        """
-        Increment total resumes counter when new resume is detected
-        """
-        try:
-            screening_job = await self.get_screening_job_by_job_id(job_id)
-            if not screening_job:
-                print(f"        Screening job not found, skipping increment")
-                return False
-            
-            screening_job["total_resumes"] += 1
-            screening_job["updated_at"] = datetime.utcnow().isoformat()
-            
-            if not hasattr(self, 'screening_jobs_container'):
-                self.screening_jobs_container = self.database.get_container_client(
-                    settings.COSMOS_DB_CONTAINER_SCREENING_JOBS
-                )
-            
-            self.screening_jobs_container.upsert_item(body=screening_job)
-            print(f"       Total resumes: {screening_job['total_resumes']}")
-            return True
-        
-        except Exception as e:
-            print(f"Error incrementing total resumes: {str(e)}")
-            return False'''
+            print(f" Error initializing screening job: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return True  # Don't fail the whole process
 
 
     async def update_screening_job_progress_by_job_id(
@@ -1008,23 +991,54 @@ class CosmosDBService:
     ) -> bool:
         """
         Update progress of a screening job after processing one resume
+         FIXED: Ensure container exists and handle properly
         """
         try:
-            # Get screening job
+            # Ensure container exists
+            if not hasattr(self, 'screening_jobs_container'):
+                try:
+                    self.screening_jobs_container = self.database.get_container_client(
+                        settings.COSMOS_DB_CONTAINER_SCREENING_JOBS
+                    )
+                except:
+                    print(f" Screening jobs container doesn't exist")
+                    return False
+            
+            # Get current screening job
             screening_job = await self.get_screening_job_by_job_id(job_id)
+            
             if not screening_job:
-                print(f"        Screening job not found for progress update")
-                return False
+                print(f"  Screening job not found, creating it now")
+                # Try to get user_id from job
+                query = "SELECT c.user_id FROM c WHERE c.job_id = @job_id"
+                parameters = [{"name": "@job_id", "value": job_id}]
+                jobs = list(self.jobs_container.query_items(
+                    query=query,
+                    parameters=parameters,
+                    enable_cross_partition_query=True
+                ))
+                
+                if jobs:
+                    user_id = jobs[0].get("user_id")
+                    await self.initialize_screening_job_for_job(job_id, user_id)
+                    screening_job = await self.get_screening_job_by_job_id(job_id)
+                
+                if not screening_job:
+                    print(f" Could not create/find screening job")
+                    return False
             
             # Update counters
-            screening_job["processed_resumes"] += 1
+            screening_job["processed_resumes"] = screening_job.get("processed_resumes", 0) + 1
             
             if status == "success":
-                screening_job["successful_resumes"] += 1
+                screening_job["successful_resumes"] = screening_job.get("successful_resumes", 0) + 1
             else:
-                screening_job["failed_resumes"] += 1
+                screening_job["failed_resumes"] = screening_job.get("failed_resumes", 0) + 1
             
             # Add resume status
+            if "resume_statuses" not in screening_job:
+                screening_job["resume_statuses"] = []
+            
             screening_job["resume_statuses"].append({
                 "filename": resume_filename,
                 "status": status,
@@ -1032,35 +1046,23 @@ class CosmosDBService:
                 "screening_id": screening_id
             })
             
-            # Update overall status
-            if screening_job["processed_resumes"] >= screening_job["total_resumes"]:
-                screening_job["status"] = "completed"
-            
+            # Update timestamp
             screening_job["updated_at"] = datetime.utcnow().isoformat()
             
-            # Calculate progress percentage
-            if screening_job["total_resumes"] > 0:
-                screening_job["progress_percentage"] = int(
-                    (screening_job["processed_resumes"] / screening_job["total_resumes"]) * 100
-                )
-            else:
-                screening_job["progress_percentage"] = 0
+            # Update status (but don't set to completed - let the status endpoint calculate)
+            screening_job["status"] = "processing"
             
-            # Ensure container is available
-            if not hasattr(self, 'screening_jobs_container'):
-                self.screening_jobs_container = self.database.get_container_client(
-                    settings.COSMOS_DB_CONTAINER_SCREENING_JOBS
-                )
-            
-            # Update in database
+            # Save to database
             self.screening_jobs_container.upsert_item(body=screening_job)
             
-            print(f" Progress for job {job_id}: {screening_job['processed_resumes']}/{screening_job['total_resumes']} ({screening_job['progress_percentage']}%)")
+            print(f" Updated progress: Processed={screening_job['processed_resumes']}, Success={screening_job['successful_resumes']}, Failed={screening_job['failed_resumes']}")
             
             return True
         
         except Exception as e:
-            print(f"Error updating screening job progress: {str(e)}")
+            print(f" Error updating screening job progress: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
 
     # Add this method to CosmosDBService class
@@ -1104,6 +1106,7 @@ class CosmosDBService:
     async def get_total_resumes_in_blob(self, job_id: str) -> int:
         """
         Count total resumes uploaded in blob storage for a job
+         FIXED: Proper blob listing and counting
         
         Args:
             job_id: Job ID
@@ -1113,6 +1116,8 @@ class CosmosDBService:
         """
         try:
             from azure.storage.blob import BlobServiceClient
+            
+            print(f"    Counting blobs for job_id: {job_id}")
             
             # Initialize blob client
             blob_service_client = BlobServiceClient.from_connection_string(
@@ -1125,15 +1130,31 @@ class CosmosDBService:
             
             # List all blobs with job_id prefix
             blob_prefix = f"{job_id}/"
-            blobs = container_client.list_blobs(name_starts_with=blob_prefix)
+            print(f"    Looking for blobs with prefix: {blob_prefix}")
+            print(f"    Container: {settings.AZURE_STORAGE_CONTAINER_RESUMES}")
+            
+            # List blobs
+            blob_list = container_client.list_blobs(name_starts_with=blob_prefix)
             
             # Count blobs (excluding folders)
-            count = sum(1 for blob in blobs if not blob.name.endswith('/'))
+            count = 0
+            blob_names = []
+            
+            for blob in blob_list:
+                # Skip if it's a folder (ends with /)
+                if not blob.name.endswith('/'):
+                    count += 1
+                    blob_names.append(blob.name)
+                    print(f"      ✓ Found: {blob.name}")
+            
+            print(f"    Total blobs found: {count}")
             
             return count
         
         except Exception as e:
-            print(f"Error counting blobs: {str(e)}")
+            print(f"    Error counting blobs: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return 0
 
 
@@ -1221,3 +1242,262 @@ class CosmosDBService:
         except Exception as e:
             print(f"Error getting screening job status: {str(e)}")
             return None
+        
+    async def get_comprehensive_screening_status(
+        self,
+        job_id: str,
+        user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get comprehensive screening status
+         UPDATED: Better progress calculation with max 100%
+        """
+        try:
+            # 1. Get full job details
+            job_data = await self.get_job_description(job_id, user_id)
+            if not job_data:
+                print(f" Job not found: {job_id} for user: {user_id}")
+                return None
+            
+            print(f" Found job: {job_data.get('screening_name')}")
+            
+            # 2. Get ALL screening results (all time)
+            all_screenings = await self.get_screening_results(job_id)
+            total_candidates_screened = len(all_screenings)
+            print(f" Total candidates screened (all time): {total_candidates_screened}")
+            
+            # 3. Get screening job tracker
+            screening_job = await self.get_screening_job_by_job_id(job_id)
+            
+            # 4. Calculate current batch progress
+            if screening_job:
+                print(f" Found screening job tracker:")
+                
+                total_in_batch = screening_job.get("total_resumes", 0)
+                processed = screening_job.get("processed_resumes", 0)
+                successful = screening_job.get("successful_resumes", 0)
+                failed = screening_job.get("failed_resumes", 0)
+                
+                print(f"   - Total in current batch: {total_in_batch}")
+                print(f"   - Processed: {processed}")
+                print(f"   - Successful: {successful}")
+                print(f"   - Failed: {failed}")
+                
+                #  FIX: Cap processed at total (in case of race conditions)
+                processed = min(processed, total_in_batch)
+                successful = min(successful, total_in_batch)
+                
+                remaining = max(0, total_in_batch - processed)
+                
+                #  FIX: Calculate progress with max 100%
+                if total_in_batch > 0:
+                    progress_percentage = min(100, int((processed / total_in_batch) * 100))
+                else:
+                    progress_percentage = 0
+                
+                # Determine status
+                if total_in_batch == 0:
+                    status = "no_resumes_in_queue"
+                elif remaining == 0 and processed > 0:
+                    status = "completed"
+                    progress_percentage = 100  # Ensure it's exactly 100
+                    print(f" Status: COMPLETED")
+                elif processed > 0:
+                    status = "processing"
+                    print(f" Status: PROCESSING ({processed}/{total_in_batch})")
+                else:
+                    status = "pending"
+                    print(f" Status: PENDING")
+                
+                current_batch = {
+                    "total_uploaded_in_queue": total_in_batch,
+                    "processed": processed,
+                    "successful": successful,
+                    "failed": failed,
+                    "remaining": remaining,
+                    "status": status,
+                    "progress_percentage": progress_percentage,
+                    "batch_start_time": screening_job.get("batch_start_time")
+                }
+            else:
+                # No tracker = no active batch
+                print(f"  No screening job tracker found")
+                print(f" Status: NO_RESUMES_IN_QUEUE")
+                current_batch = {
+                    "total_uploaded_in_queue": 0,
+                    "processed": 0,
+                    "successful": 0,
+                    "failed": 0,
+                    "remaining": 0,
+                    "status": "no_resumes_in_queue",
+                    "progress_percentage": 0,
+                    "batch_start_time": None
+                }
+            
+            # 5. Return complete response
+            return {
+                "job_id": job_data.get("job_id"),
+                "screening_name": job_data.get("screening_name"),
+                "job_description_text": job_data.get("job_description_text"),
+                "filename": job_data.get("filename"),
+                "must_have_skills": job_data.get("must_have_skills", []),
+                "nice_to_have_skills": job_data.get("nice_to_have_skills", []),
+                "created_at": job_data.get("created_at"),
+                "blob_url": job_data.get("blob_url"),
+                "total_candidates_screened": total_candidates_screened,
+                "current_batch": current_batch,
+                "screening_results": all_screenings
+            }
+        
+        except Exception as e:
+            print(f" Error in get_comprehensive_screening_status: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+    async def initialize_or_increment_batch_total(
+        self,
+        job_id: str,
+        user_id: str
+    ) -> bool:
+        """
+        Initialize screening job tracker OR increment total_resumes count
+         UPDATED: Resets tracker when new batch starts
+        """
+        try:
+            # Ensure container exists
+            if not hasattr(self, 'screening_jobs_container'):
+                try:
+                    self.screening_jobs_container = self.database.get_container_client(
+                        settings.COSMOS_DB_CONTAINER_SCREENING_JOBS
+                    )
+                except:
+                    self.screening_jobs_container = self.database.create_container_if_not_exists(
+                        id=settings.COSMOS_DB_CONTAINER_SCREENING_JOBS,
+                        partition_key=PartitionKey(path="/job_id")
+                    )
+            
+            # Check if we should reset for new batch
+            should_reset = await self.should_reset_tracker_for_new_batch(job_id)
+            
+            if should_reset:
+                # Delete old tracker and create fresh one
+                try:
+                    self.screening_jobs_container.delete_item(
+                        item=job_id,
+                        partition_key=job_id
+                    )
+                    print(f"       Deleted old completed tracker")
+                except:
+                    pass
+            
+            # Try to get existing tracker
+            screening_job = await self.get_screening_job_by_job_id(job_id)
+            
+            if not screening_job:
+                # Create new tracker with count = 1
+                screening_job_data = {
+                    "id": job_id,
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "total_resumes": 1,  # First resume in this batch
+                    "processed_resumes": 0,
+                    "successful_resumes": 0,
+                    "failed_resumes": 0,
+                    "status": "processing",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat(),
+                    "batch_start_time": datetime.utcnow().isoformat(),  # Track batch start
+                    "resume_statuses": []
+                }
+                
+                try:
+                    self.screening_jobs_container.create_item(body=screening_job_data)
+                    print(f"       Created NEW screening job tracker: total_resumes=1")
+                    return True
+                except exceptions.CosmosResourceExistsError:
+                    # Race condition - another message created it
+                    screening_job = await self.get_screening_job_by_job_id(job_id)
+                    if screening_job:
+                        screening_job["total_resumes"] = screening_job.get("total_resumes", 0) + 1
+                        screening_job["updated_at"] = datetime.utcnow().isoformat()
+                        self.screening_jobs_container.upsert_item(body=screening_job)
+                        print(f"       Incremented total_resumes to {screening_job['total_resumes']}")
+                    return True
+            else:
+                # Tracker exists - increment total
+                screening_job["total_resumes"] = screening_job.get("total_resumes", 0) + 1
+                screening_job["updated_at"] = datetime.utcnow().isoformat()
+                self.screening_jobs_container.upsert_item(body=screening_job)
+                print(f"       Incremented total_resumes to {screening_job['total_resumes']}")
+                return True
+        
+        except Exception as e:
+            print(f" Error in initialize_or_increment_batch_total: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return True 
+        
+    async def reset_screening_job_for_new_batch(
+        self,
+        job_id: str
+    ) -> bool:
+        """
+        Reset screening job tracker for a new batch
+        Call this when starting a completely new upload session
+        
+         OPTIONAL: Only needed if you want to clear tracker between batches
+        """
+        try:
+            screening_job = await self.get_screening_job_by_job_id(job_id)
+            
+            if screening_job:
+                # Check if previous batch was completed
+                if screening_job.get("status") == "completed":
+                    # Delete old tracker to start fresh
+                    self.screening_jobs_container.delete_item(
+                        item=job_id,
+                        partition_key=job_id
+                    )
+                    print(f" Deleted old completed tracker for new batch")
+                    return True
+            
+            return False
+        except Exception as e:
+            print(f"Error resetting tracker: {str(e)}")
+            return False
+
+    async def should_reset_tracker_for_new_batch(
+        self,
+        job_id: str
+    ) -> bool:
+        """
+        Check if we should reset the tracker for a new batch
+        
+        Returns True if:
+        - Previous batch was completed (all files processed)
+        - Some time has passed since last upload
+        
+        Returns:
+            True if tracker should be reset, False otherwise
+        """
+        try:
+            screening_job = await self.get_screening_job_by_job_id(job_id)
+            
+            if not screening_job:
+                # No tracker exists = first batch
+                return False
+            
+            total = screening_job.get("total_resumes", 0)
+            processed = screening_job.get("processed_resumes", 0)
+            
+            # If previous batch was completed (all files processed)
+            if total > 0 and processed >= total:
+                print(f"        Previous batch was completed ({processed}/{total})")
+                print(f"       Starting new batch - resetting tracker")
+                return True
+            
+            return False
+        
+        except Exception as e:
+            print(f"Error checking batch reset: {str(e)}")
+            return False
