@@ -271,6 +271,47 @@ class CosmosDBService:
         except Exception as e:
             print(f"Failed to update screening count: {str(e)}")
 
+    async def check_duplicate_screening_name(
+        self,
+        user_id: str,
+        screening_name: str
+    ) -> bool:
+        """
+        Check if screening_name already exists for this user
+        
+        Args:
+            user_id: User ID
+            screening_name: Screening name to check
+        
+        Returns:
+            True if duplicate exists, False otherwise
+        """
+        try:
+            query = """
+            SELECT VALUE COUNT(1)
+            FROM c
+            WHERE c.user_id = @user_id 
+            AND c.screening_name = @screening_name
+            """
+            
+            parameters = [
+                {"name": "@user_id", "value": user_id},
+                {"name": "@screening_name", "value": screening_name}
+            ]
+            
+            result = list(self.jobs_container.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True
+            ))
+            
+            count = result[0] if result else 0
+            return count > 0
+            
+        except Exception as e:
+            print(f"Error checking duplicate screening name: {str(e)}")
+            return False  # If error, allow creation (fail open)
+
     async def create_screening_job(
         self,
         screening_job_id: str,
@@ -990,8 +1031,8 @@ class CosmosDBService:
         screening_id: Optional[str] = None
     ) -> bool:
         """
-        Update progress of a screening job after processing one resume
-         FIXED: Ensure container exists and handle properly
+        Update progress after processing one resume
+         UPDATED: Updates both current_batch and all_time counters
         """
         try:
             # Ensure container exists
@@ -1008,26 +1049,18 @@ class CosmosDBService:
             screening_job = await self.get_screening_job_by_job_id(job_id)
             
             if not screening_job:
-                print(f"  Screening job not found, creating it now")
-                # Try to get user_id from job
-                query = "SELECT c.user_id FROM c WHERE c.job_id = @job_id"
-                parameters = [{"name": "@job_id", "value": job_id}]
-                jobs = list(self.jobs_container.query_items(
-                    query=query,
-                    parameters=parameters,
-                    enable_cross_partition_query=True
-                ))
-                
-                if jobs:
-                    user_id = jobs[0].get("user_id")
-                    await self.initialize_screening_job_for_job(job_id, user_id)
-                    screening_job = await self.get_screening_job_by_job_id(job_id)
-                
-                if not screening_job:
-                    print(f" Could not create/find screening job")
-                    return False
+                print(f"  No tracker found")
+                return False
             
-            # Update counters
+            #  Update CURRENT BATCH counters
+            screening_job["current_batch_processed"] = screening_job.get("current_batch_processed", 0) + 1
+            
+            if status == "success":
+                screening_job["current_batch_successful"] = screening_job.get("current_batch_successful", 0) + 1
+            else:
+                screening_job["current_batch_failed"] = screening_job.get("current_batch_failed", 0) + 1
+            
+            #  Update ALL-TIME counters
             screening_job["processed_resumes"] = screening_job.get("processed_resumes", 0) + 1
             
             if status == "success":
@@ -1049,18 +1082,20 @@ class CosmosDBService:
             # Update timestamp
             screening_job["updated_at"] = datetime.utcnow().isoformat()
             
-            # Update status (but don't set to completed - let the status endpoint calculate)
-            screening_job["status"] = "processing"
-            
             # Save to database
             self.screening_jobs_container.upsert_item(body=screening_job)
             
-            print(f" Updated progress: Processed={screening_job['processed_resumes']}, Success={screening_job['successful_resumes']}, Failed={screening_job['failed_resumes']}")
+            current_batch_total = screening_job.get("current_batch_total", 0)
+            current_batch_processed = screening_job.get("current_batch_processed", 0)
+            
+            print(f" Updated progress:")
+            print(f"   Current batch: {current_batch_processed}/{current_batch_total}")
+            print(f"   All-time: {screening_job['processed_resumes']}")
             
             return True
         
         except Exception as e:
-            print(f" Error updating screening job progress: {str(e)}")
+            print(f" Error updating progress: {str(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -1105,8 +1140,8 @@ class CosmosDBService:
 
     async def get_total_resumes_in_blob(self, job_id: str) -> int:
         """
-        Count total resumes uploaded in blob storage for a job
-         FIXED: Proper blob listing and counting
+        Count total resumes currently in blob storage for a job
+         ENHANCED: Better error handling and debugging
         
         Args:
             job_id: Job ID
@@ -1117,7 +1152,9 @@ class CosmosDBService:
         try:
             from azure.storage.blob import BlobServiceClient
             
-            print(f"    Counting blobs for job_id: {job_id}")
+            print(f" Counting blobs for job_id: {job_id}")
+            print(f"   Container: {settings.AZURE_STORAGE_CONTAINER_RESUMES}")
+            print(f"   Blob prefix: {job_id}/")
             
             # Initialize blob client
             blob_service_client = BlobServiceClient.from_connection_string(
@@ -1130,118 +1167,38 @@ class CosmosDBService:
             
             # List all blobs with job_id prefix
             blob_prefix = f"{job_id}/"
-            print(f"    Looking for blobs with prefix: {blob_prefix}")
-            print(f"    Container: {settings.AZURE_STORAGE_CONTAINER_RESUMES}")
+            print(f"   Listing blobs with prefix: {blob_prefix}")
             
-            # List blobs
-            blob_list = container_client.list_blobs(name_starts_with=blob_prefix)
+            blobs = container_client.list_blobs(name_starts_with=blob_prefix)
             
             # Count blobs (excluding folders)
             count = 0
             blob_names = []
             
-            for blob in blob_list:
+            for blob in blobs:
+                print(f"   Found blob: {blob.name}")
                 # Skip if it's a folder (ends with /)
                 if not blob.name.endswith('/'):
                     count += 1
                     blob_names.append(blob.name)
-                    print(f"      ✓ Found: {blob.name}")
             
-            print(f"    Total blobs found: {count}")
+            print(f" Total files in blob storage for job {job_id}: {count}")
+            if blob_names:
+                print(f"   Files: {blob_names}")
+            else:
+                print(f"    No files found! Check if files were uploaded.")
             
             return count
         
         except Exception as e:
-            print(f"    Error counting blobs: {str(e)}")
+            print(f" Error counting blobs: {str(e)}")
+            print(f"   Connection string exists: {bool(settings.AZURE_STORAGE_CONNECTION_STRING)}")
+            print(f"   Container name: {settings.AZURE_STORAGE_CONTAINER_RESUMES}")
             import traceback
             traceback.print_exc()
             return 0
 
 
-    async def get_screening_job_status_by_job_id(
-        self,
-        job_id: str,
-        user_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get current status of a screening job by job_id (for polling)
-         UPDATED: Shows total_resumes immediately from blob storage
-        """
-        try:
-            # Verify job belongs to user
-            job_data = await self.get_job_description(job_id, user_id)
-            if not job_data:
-                return None
-            
-            #  Get total resumes from BLOB STORAGE (not from tracker)
-            total_resumes_in_blob = await self.get_total_resumes_in_blob(job_id)
-            
-            # Get screening job tracker
-            screening_job = await self.get_screening_job_by_job_id(job_id)
-            
-            if not screening_job:
-                # No processing started yet, but show total from blob
-                if total_resumes_in_blob > 0:
-                    # Files uploaded but not processed yet
-                    return {
-                        "job_id": job_id,
-                        "status": "pending",  # New status
-                        "total_resumes": total_resumes_in_blob,
-                        "processed_resumes": 0,
-                        "successful_resumes": 0,
-                        "failed_resumes": 0,
-                        "progress_percentage": 0,
-                        "completed_results": []
-                    }
-                else:
-                    # No files uploaded
-                    return {
-                        "job_id": job_id,
-                        "status": "no_resumes",
-                        "total_resumes": 0,
-                        "processed_resumes": 0,
-                        "successful_resumes": 0,
-                        "failed_resumes": 0,
-                        "progress_percentage": 0,
-                        "completed_results": []
-                    }
-            
-            # Get completed screening results
-            completed_screenings = await self.get_screening_results(job_id)
-            
-            #  Use blob count as source of truth for total
-            processed_resumes = screening_job["processed_resumes"]
-            
-            # Calculate progress
-            if total_resumes_in_blob > 0:
-                progress_percentage = int((processed_resumes / total_resumes_in_blob) * 100)
-            else:
-                progress_percentage = 0
-            
-            # Determine status
-            if processed_resumes >= total_resumes_in_blob and total_resumes_in_blob > 0:
-                status = "completed"
-            elif processed_resumes > 0:
-                status = "processing"
-            else:
-                status = "pending"
-            
-            return {
-                "job_id": job_id,
-                "status": status,
-                "total_resumes": total_resumes_in_blob,  #  From blob storage
-                "processed_resumes": processed_resumes,
-                "successful_resumes": screening_job.get("successful_resumes", 0),
-                "failed_resumes": screening_job.get("failed_resumes", 0),
-                "progress_percentage": progress_percentage,
-                "created_at": screening_job.get("created_at"),
-                "updated_at": screening_job.get("updated_at"),
-                "completed_results": completed_screenings
-            }
-        
-        except Exception as e:
-            print(f"Error getting screening job status: {str(e)}")
-            return None
         
     async def get_comprehensive_screening_status(
         self,
@@ -1250,7 +1207,7 @@ class CosmosDBService:
     ) -> Optional[Dict[str, Any]]:
         """
         Get comprehensive screening status
-         UPDATED: Better progress calculation with max 100%
+        UPDATED: Uses current_batch_total from tracker
         """
         try:
             # 1. Get full job details
@@ -1269,60 +1226,62 @@ class CosmosDBService:
             # 3. Get screening job tracker
             screening_job = await self.get_screening_job_by_job_id(job_id)
             
-            # 4. Calculate current batch progress
+            # 4. Calculate current batch status
             if screening_job:
-                print(f" Found screening job tracker:")
+                current_batch_total = screening_job.get("current_batch_total", 0)
+                current_batch_processed = screening_job.get("current_batch_processed", 0)
+                current_batch_successful = screening_job.get("current_batch_successful", 0)
+                current_batch_failed = screening_job.get("current_batch_failed", 0)
                 
-                total_in_batch = screening_job.get("total_resumes", 0)
-                processed = screening_job.get("processed_resumes", 0)
-                successful = screening_job.get("successful_resumes", 0)
-                failed = screening_job.get("failed_resumes", 0)
+                print(f" Found tracker:")
+                print(f"   Current batch total: {current_batch_total}")
+                print(f"   Current batch processed: {current_batch_processed}")
+                print(f"   Current batch successful: {current_batch_successful}")
+                print(f"   Current batch failed: {current_batch_failed}")
                 
-                print(f"   - Total in current batch: {total_in_batch}")
-                print(f"   - Processed: {processed}")
-                print(f"   - Successful: {successful}")
-                print(f"   - Failed: {failed}")
-                
-                #  FIX: Cap processed at total (in case of race conditions)
-                processed = min(processed, total_in_batch)
-                successful = min(successful, total_in_batch)
-                
-                remaining = max(0, total_in_batch - processed)
-                
-                #  FIX: Calculate progress with max 100%
-                if total_in_batch > 0:
-                    progress_percentage = min(100, int((processed / total_in_batch) * 100))
+                if current_batch_total > 0:
+                    remaining = max(0, current_batch_total - current_batch_processed)
+                    
+                    #  Calculate progress percentage correctly
+                    progress_percentage = int((current_batch_processed / current_batch_total) * 100)
+                    progress_percentage = min(100, progress_percentage)  # Cap at 100
+                    
+                    # Determine status
+                    if remaining == 0:
+                        status = "completed"
+                        progress_percentage = 100
+                        print(f"   Status: COMPLETED")
+                    elif current_batch_processed > 0:
+                        status = "processing"
+                        print(f"   Status: PROCESSING ({current_batch_processed}/{current_batch_total})")
+                    else:
+                        status = "pending"
+                        print(f"   Status: PENDING")
+                    
+                    current_batch = {
+                        "total_uploaded_in_queue": current_batch_total,
+                        "processed": current_batch_processed,
+                        "successful": current_batch_successful,
+                        "failed": current_batch_failed,
+                        "remaining": remaining,
+                        "status": status,
+                        "progress_percentage": progress_percentage,
+                        "batch_start_time": screening_job.get("batch_start_time")
+                    }
                 else:
-                    progress_percentage = 0
-                
-                # Determine status
-                if total_in_batch == 0:
-                    status = "no_resumes_in_queue"
-                elif remaining == 0 and processed > 0:
-                    status = "completed"
-                    progress_percentage = 100  # Ensure it's exactly 100
-                    print(f" Status: COMPLETED")
-                elif processed > 0:
-                    status = "processing"
-                    print(f" Status: PROCESSING ({processed}/{total_in_batch})")
-                else:
-                    status = "pending"
-                    print(f" Status: PENDING")
-                
-                current_batch = {
-                    "total_uploaded_in_queue": total_in_batch,
-                    "processed": processed,
-                    "successful": successful,
-                    "failed": failed,
-                    "remaining": remaining,
-                    "status": status,
-                    "progress_percentage": progress_percentage,
-                    "batch_start_time": screening_job.get("batch_start_time")
-                }
+                    # No active batch
+                    current_batch = {
+                        "total_uploaded_in_queue": 0,
+                        "processed": 0,
+                        "successful": 0,
+                        "failed": 0,
+                        "remaining": 0,
+                        "status": "no_resumes_in_queue",
+                        "progress_percentage": 0
+                    }
             else:
-                # No tracker = no active batch
-                print(f"  No screening job tracker found")
-                print(f" Status: NO_RESUMES_IN_QUEUE")
+                # No tracker = no files uploaded
+                print(f"  No tracker found")
                 current_batch = {
                     "total_uploaded_in_queue": 0,
                     "processed": 0,
@@ -1330,8 +1289,7 @@ class CosmosDBService:
                     "failed": 0,
                     "remaining": 0,
                     "status": "no_resumes_in_queue",
-                    "progress_percentage": 0,
-                    "batch_start_time": None
+                    "progress_percentage": 0
                 }
             
             # 5. Return complete response
@@ -1354,14 +1312,15 @@ class CosmosDBService:
             import traceback
             traceback.print_exc()
             return None
+
     async def initialize_or_increment_batch_total(
         self,
         job_id: str,
         user_id: str
     ) -> bool:
         """
-        Initialize screening job tracker OR increment total_resumes count
-         UPDATED: Resets tracker when new batch starts
+        Initialize tracker and detect new batch
+         UPDATED: Detects new batch and sets current_batch_total
         """
         try:
             # Ensure container exists
@@ -1376,66 +1335,115 @@ class CosmosDBService:
                         partition_key=PartitionKey(path="/job_id")
                     )
             
-            # Check if we should reset for new batch
-            should_reset = await self.should_reset_tracker_for_new_batch(job_id)
-            
-            if should_reset:
-                # Delete old tracker and create fresh one
-                try:
-                    self.screening_jobs_container.delete_item(
-                        item=job_id,
-                        partition_key=job_id
-                    )
-                    print(f"       Deleted old completed tracker")
-                except:
-                    pass
-            
-            # Try to get existing tracker
+            # Get existing tracker
             screening_job = await self.get_screening_job_by_job_id(job_id)
             
             if not screening_job:
-                # Create new tracker with count = 1
+                # No tracker exists - this is the FIRST file of a NEW batch
+                # Count all files currently in blob to set batch total
+                from azure.storage.blob import BlobServiceClient
+                
+                blob_service_client = BlobServiceClient.from_connection_string(
+                    settings.AZURE_STORAGE_CONNECTION_STRING
+                )
+                
+                container_client = blob_service_client.get_container_client(
+                    settings.AZURE_STORAGE_CONTAINER_RESUMES
+                )
+                
+                blob_prefix = f"{job_id}/"
+                blob_count = 0
+                
+                for blob in container_client.list_blobs(name_starts_with=blob_prefix):
+                    if not blob.name.endswith('/'):
+                        blob_count += 1
+                
+                print(f"       First file of NEW batch detected!")
+                print(f"       Total files in blob: {blob_count}")
+                print(f"       Locking batch size: {blob_count}")
+                
+                # Create tracker with batch total locked in
                 screening_job_data = {
                     "id": job_id,
                     "job_id": job_id,
                     "user_id": user_id,
-                    "total_resumes": 1,  # First resume in this batch
+                    "current_batch_total": blob_count,  #  Lock batch size
+                    "current_batch_processed": 0,
+                    "current_batch_successful": 0,
+                    "current_batch_failed": 0,
                     "processed_resumes": 0,
                     "successful_resumes": 0,
                     "failed_resumes": 0,
                     "status": "processing",
                     "created_at": datetime.utcnow().isoformat(),
                     "updated_at": datetime.utcnow().isoformat(),
-                    "batch_start_time": datetime.utcnow().isoformat(),  # Track batch start
+                    "batch_start_time": datetime.utcnow().isoformat(),
                     "resume_statuses": []
                 }
                 
                 try:
                     self.screening_jobs_container.create_item(body=screening_job_data)
-                    print(f"       Created NEW screening job tracker: total_resumes=1")
-                    return True
+                    print(f"       Created tracker with batch_total={blob_count}")
                 except exceptions.CosmosResourceExistsError:
-                    # Race condition - another message created it
-                    screening_job = await self.get_screening_job_by_job_id(job_id)
-                    if screening_job:
-                        screening_job["total_resumes"] = screening_job.get("total_resumes", 0) + 1
-                        screening_job["updated_at"] = datetime.utcnow().isoformat()
-                        self.screening_jobs_container.upsert_item(body=screening_job)
-                        print(f"       Incremented total_resumes to {screening_job['total_resumes']}")
-                    return True
+                    print(f"        Tracker created by another message")
             else:
-                # Tracker exists - increment total
-                screening_job["total_resumes"] = screening_job.get("total_resumes", 0) + 1
-                screening_job["updated_at"] = datetime.utcnow().isoformat()
-                self.screening_jobs_container.upsert_item(body=screening_job)
-                print(f"       Incremented total_resumes to {screening_job['total_resumes']}")
-                return True
+                # Tracker exists - check if this is a new batch
+                current_batch_total = screening_job.get("current_batch_total", 0)
+                current_batch_processed = screening_job.get("current_batch_processed", 0)
+                
+                print(f"        Tracker exists:")
+                print(f"         Batch total: {current_batch_total}")
+                print(f"         Batch processed: {current_batch_processed}")
+                
+                # Check if previous batch is completed
+                if current_batch_total > 0 and current_batch_processed >= current_batch_total:
+                    print(f"       Previous batch completed!")
+                    print(f"       Detecting new batch...")
+                    
+                    # Count files in blob
+                    from azure.storage.blob import BlobServiceClient
+                    
+                    blob_service_client = BlobServiceClient.from_connection_string(
+                        settings.AZURE_STORAGE_CONNECTION_STRING
+                    )
+                    
+                    container_client = blob_service_client.get_container_client(
+                        settings.AZURE_STORAGE_CONTAINER_RESUMES
+                    )
+                    
+                    blob_prefix = f"{job_id}/"
+                    blob_count = 0
+                    
+                    for blob in container_client.list_blobs(name_starts_with=blob_prefix):
+                        if not blob.name.endswith('/'):
+                            blob_count += 1
+                    
+                    # If there are MORE files than processed, it's a new batch
+                    if blob_count > current_batch_processed:
+                        new_batch_size = blob_count - current_batch_processed
+                        print(f"       NEW BATCH detected!")
+                        print(f"         Total files in blob: {blob_count}")
+                        print(f"         Previously processed: {current_batch_processed}")
+                        print(f"         New batch size: {new_batch_size}")
+                        
+                        # Reset batch counters for new batch
+                        screening_job["current_batch_total"] = new_batch_size
+                        screening_job["current_batch_processed"] = 0
+                        screening_job["current_batch_successful"] = 0
+                        screening_job["current_batch_failed"] = 0
+                        screening_job["batch_start_time"] = datetime.utcnow().isoformat()
+                        screening_job["updated_at"] = datetime.utcnow().isoformat()
+                        
+                        self.screening_jobs_container.upsert_item(body=screening_job)
+                        print(f"       Reset tracker for new batch")
+            
+            return True
         
         except Exception as e:
             print(f" Error in initialize_or_increment_batch_total: {str(e)}")
             import traceback
             traceback.print_exc()
-            return True 
+            return True
         
     async def reset_screening_job_for_new_batch(
         self,
@@ -1501,3 +1509,152 @@ class CosmosDBService:
         except Exception as e:
             print(f"Error checking batch reset: {str(e)}")
             return False
+        
+    async def get_current_batch_info(self, job_id: str) -> Dict[str, Any]:
+        """
+        Get current batch information by comparing blob storage with processed files
+         FIXED: Better filename comparison and detailed logging
+        """
+        try:
+            from azure.storage.blob import BlobServiceClient
+            
+            print(f"\n{'='*60}")
+            print(f" BATCH INFO ANALYSIS FOR JOB: {job_id}")
+            print(f"{'='*60}")
+            
+            # 1. Get all files in blob storage
+            blob_service_client = BlobServiceClient.from_connection_string(
+                settings.AZURE_STORAGE_CONNECTION_STRING
+            )
+            
+            container_client = blob_service_client.get_container_client(
+                settings.AZURE_STORAGE_CONTAINER_RESUMES
+            )
+            
+            blob_prefix = f"{job_id}/"
+            files_in_blob = []
+            
+            print(f"\n STEP 1: Scanning blob storage...")
+            print(f"   Container: {settings.AZURE_STORAGE_CONTAINER_RESUMES}")
+            print(f"   Prefix: {blob_prefix}")
+            
+            for blob in container_client.list_blobs(name_starts_with=blob_prefix):
+                # Skip folders
+                if not blob.name.endswith('/'):
+                    # Extract just the filename (remove job_id/ prefix)
+                    filename = blob.name.replace(blob_prefix, "")
+                    files_in_blob.append({
+                        "filename": filename,
+                        "full_path": blob.name,
+                        "created": blob.creation_time
+                    })
+                    print(f"    Found: {filename}")
+            
+            print(f"\n    Total files in blob: {len(files_in_blob)}")
+            
+            # 2. Get processed files from tracker
+            print(f"\n STEP 2: Checking processed files in tracker...")
+            screening_job = await self.get_screening_job_by_job_id(job_id)
+            
+            processed_files = set()
+            processed_files_list = []  # For detailed logging
+            all_time_processed_count = 0
+            all_time_successful_count = 0
+            all_time_failed_count = 0
+            
+            if screening_job:
+                resume_statuses = screening_job.get("resume_statuses", [])
+                all_time_processed_count = screening_job.get("processed_resumes", 0)
+                all_time_successful_count = screening_job.get("successful_resumes", 0)
+                all_time_failed_count = screening_job.get("failed_resumes", 0)
+                
+                print(f"   Tracker stats:")
+                print(f"   - Processed: {all_time_processed_count}")
+                print(f"   - Successful: {all_time_successful_count}")
+                print(f"   - Failed: {all_time_failed_count}")
+                print(f"   - Resume statuses entries: {len(resume_statuses)}")
+                
+                for status in resume_statuses:
+                    filename = status.get("filename")
+                    if filename:
+                        processed_files.add(filename)
+                        processed_files_list.append({
+                            "filename": filename,
+                            "status": status.get("status"),
+                            "processed_at": status.get("processed_at")
+                        })
+                        print(f"    Processed: {filename} ({status.get('status')})")
+                
+                print(f"\n    Total unique processed files: {len(processed_files)}")
+            else:
+                print(f"     No tracker found - all files are unprocessed")
+            
+            # 3. Find unprocessed files (current batch)
+            print(f"\n STEP 3: Identifying unprocessed files...")
+            unprocessed_files = []
+            
+            for blob_info in files_in_blob:
+                blob_filename = blob_info["filename"]
+                is_processed = blob_filename in processed_files
+                
+                print(f"   Checking: {blob_filename}")
+                print(f"      → In processed list: {is_processed}")
+                
+                if not is_processed:
+                    unprocessed_files.append(blob_info)
+                    print(f"      →  UNPROCESSED (part of current batch)")
+                else:
+                    print(f"      →  Already processed (not in current batch)")
+            
+            print(f"\n    Unprocessed files (current batch): {len(unprocessed_files)}")
+            
+            # 4. Calculate current batch size
+            # Current batch = unprocessed files only
+            current_batch_size = len(unprocessed_files)
+            current_batch_processed = 0
+            current_batch_successful = 0
+            current_batch_failed = 0
+            
+            print(f"\n STEP 4: Calculating batch metrics...")
+            print(f"   Current batch size: {current_batch_size}")
+            print(f"   Current batch processed: {current_batch_processed}")
+            
+            print(f"\n{'='*60}")
+            print(f"SUMMARY:")
+            print(f"{'='*60}")
+            print(f"Files in blob storage: {len(files_in_blob)}")
+            print(f"All-time processed: {all_time_processed_count}")
+            print(f"Unprocessed (current batch): {len(unprocessed_files)}")
+            print(f"{'='*60}\n")
+            
+            return {
+                "total_in_blob": len(files_in_blob),
+                "processed_files": list(processed_files),
+                "processed_files_list": processed_files_list,
+                "unprocessed_files": [f["filename"] for f in unprocessed_files],
+                "current_batch_size": current_batch_size,
+                "current_batch_processed": current_batch_processed,
+                "current_batch_successful": current_batch_successful,
+                "current_batch_failed": current_batch_failed,
+                "all_time_processed": all_time_processed_count,
+                "all_time_successful": all_time_successful_count,
+                "all_time_failed": all_time_failed_count
+            }
+        
+        except Exception as e:
+            print(f" ERROR in get_current_batch_info: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "total_in_blob": 0,
+                "processed_files": [],
+                "processed_files_list": [],
+                "unprocessed_files": [],
+                "current_batch_size": 0,
+                "current_batch_processed": 0,
+                "current_batch_successful": 0,
+                "current_batch_failed": 0,
+                "all_time_processed": 0,
+                "all_time_successful": 0,
+                "all_time_failed": 0
+            }

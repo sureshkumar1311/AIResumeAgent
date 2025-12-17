@@ -329,32 +329,6 @@ async def upload_job_description(
 ):
     """
     Upload job description with JSON body (supports base64 file or text)
-    
-    Args:
-        job_data: Job description request with screening_name, job_description_file (base64), 
-                  or description text
-        current_user: Authenticated user (injected by dependency)
-    
-    Returns:
-        JobDescriptionResponse with job_id and auto-extracted skills
-    
-    Example JSON Body with Base64 File:
-    {
-        "screening_name": "Senior Python Developer - Q4 2024",
-        "job_description_file": "data:application/pdf;base64,JVBERi0xLjQKJeLjz9MKMyAwIG9iago8PC9UeXBlIC9QYWdlCi9QYXJlbn..."
-    }
-    
-    OR with just base64:
-    {
-        "screening_name": "Senior Python Developer - Q4 2024",
-        "job_description_file": "JVBERi0xLjQKJeLjz9MKMyAwIG9iago8PC9UeXBlIC9QYWdlCi9QYXJlbn..."
-    }
-    
-    OR with manual text:
-    {
-        "screening_name": "Senior Python Developer - Q4 2024",
-        "description": "We are looking for a senior Python developer..."
-    }
     """
     try:
         # Validate inputs
@@ -368,6 +342,18 @@ async def upload_job_description(
             raise HTTPException(
                 status_code=400,
                 detail="Please provide either job_description_file OR description text, not both."
+            )
+        
+        #  NEW: Check for duplicate screening_name for this user
+        duplicate_check = await cosmos_service.check_duplicate_screening_name(
+            user_id=current_user["user_id"],
+            screening_name=job_data.screening_name
+        )
+        
+        if duplicate_check:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A job description with screening name '{job_data.screening_name}' already exists for this user."
             )
         
         blob_url = None
@@ -411,32 +397,47 @@ async def upload_job_description(
                             detail="Invalid data URI format. Expected format: data:mime/type;base64,xxxxx"
                         )
                 else:
-                    # No data URI prefix - try to detect file type from base64 content
-                    # Decode first few bytes to detect file signature
+                    #  FIXED: Better file type detection from base64 content
                     try:
-                        decoded_preview = base64.b64decode(base64_data[:100])
+                        # Decode enough bytes to check signatures
+                        decoded_preview = base64.b64decode(base64_data[:200])  # Increased from 100 to 200
                         
                         # PDF signature: %PDF
                         if decoded_preview.startswith(b'%PDF'):
                             file_extension = '.pdf'
                             content_type = 'application/pdf'
-                        # DOCX signature: PK (ZIP format)
+                        # DOCX signature: PK (ZIP format) - check for word in content
                         elif decoded_preview.startswith(b'PK\x03\x04'):
                             file_extension = '.docx'
                             content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                        # DOC signature: D0CF11E0 (OLE format)
-                        elif decoded_preview.startswith(b'\xD0\xCF\x11\xE0'):
+                        #  DOC signature: D0CF11E0 (OLE/Compound File format) - Multiple variations
+                        elif (decoded_preview.startswith(b'\xD0\xCF\x11\xE0') or 
+                              decoded_preview.startswith(b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1') or
+                              decoded_preview[:4] == b'\xD0\xCF\x11\xE0'):
+                            file_extension = '.doc'
+                            content_type = 'application/msword'
+                        #  Alternative DOC detection - check for common OLE patterns
+                        elif b'\x00Equation Native' in decoded_preview or b'Microsoft Word' in decoded_preview:
                             file_extension = '.doc'
                             content_type = 'application/msword'
                         else:
+                            # Show first 20 bytes in hex for debugging
+                            preview_hex = decoded_preview[:20].hex()
                             raise HTTPException(
                                 status_code=400,
-                                detail="Unable to detect file type. Please provide base64 with data URI prefix (data:application/pdf;base64,...) or ensure file is PDF/DOCX format."
+                                detail=f"Unable to detect file type. File signature: {preview_hex}. Supported formats: PDF (.pdf), Word (.doc, .docx). Please use data URI format: data:application/pdf;base64,... or data:application/msword;base64,..."
                             )
+                    except base64.binascii.Error:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Invalid base64 encoding"
+                        )
+                    except HTTPException:
+                        raise
                     except Exception as e:
                         raise HTTPException(
                             status_code=400,
-                            detail="Unable to detect file type from base64 content. Please use data URI format."
+                            detail=f"Unable to detect file type from base64 content: {str(e)}. Please use data URI format."
                         )
                 
                 # Generate filename with timestamp
@@ -501,8 +502,8 @@ async def upload_job_description(
             user_id=current_user["user_id"],
             screening_name=job_data.screening_name,
             job_description_text=job_description_text,
-            must_have_skills=must_have_skills,  # List of strings
-            nice_to_have_skills=nice_to_have_skills,  # List of strings
+            must_have_skills=must_have_skills,
+            nice_to_have_skills=nice_to_have_skills,
             filename=filename,
             blob_url=blob_url
         )
@@ -520,7 +521,6 @@ async def upload_job_description(
     except Exception as e:
         print(f"Error in upload_job_description: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/api/screening-status/{job_id}")
 async def get_comprehensive_screening_status(

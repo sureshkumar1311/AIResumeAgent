@@ -32,3 +32,6 @@ bcrypt
 azure-servicebus 
 azure-storage-blob 
 azure-eventgrid
+
+msoffcrypto-tool
+olefile
