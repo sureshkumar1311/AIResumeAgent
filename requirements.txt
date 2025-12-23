@@ -36,3 +36,4 @@ azure-eventgrid
 msoffcrypto-tool
 
 docx2txt
+olefile
