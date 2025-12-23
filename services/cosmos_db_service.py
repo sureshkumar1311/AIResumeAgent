@@ -540,37 +540,80 @@ class CosmosDBService:
     
     async def get_screening_results(
         self,
-        job_id: str,
-        limit: Optional[int] = None
-    ) -> List[Dict[str, Any]]:
+        job_id: str
+    ) -> list:
         """
         Get all screening results for a job
+         FIXED: Adds SAS token to resume URLs
         
         Args:
             job_id: Job ID
-            limit: Optional limit on number of results
         
         Returns:
-            List of screening results
+            List of screening results with working resume URLs
         """
         try:
+            if not hasattr(self, 'screenings_container'):
+                return []
+            
             query = "SELECT * FROM c WHERE c.job_id = @job_id ORDER BY c.screened_at DESC"
             parameters = [{"name": "@job_id", "value": job_id}]
             
-            items = list(self.screenings_container.query_items(
+            results = list(self.screenings_container.query_items(
                 query=query,
                 parameters=parameters,
-                enable_cross_partition_query=False,
                 partition_key=job_id
             ))
             
-            if limit:
-                items = items[:limit]
+            #  Add SAS tokens to resume URLs
+            from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+            from datetime import datetime, timedelta
             
-            return items
-        
+            try:
+                blob_service_client = BlobServiceClient.from_connection_string(
+                    settings.AZURE_STORAGE_CONNECTION_STRING
+                )
+                
+                # Extract account name and key from connection string
+                conn_parts = dict(item.split('=', 1) for item in settings.AZURE_STORAGE_CONNECTION_STRING.split(';') if '=' in item)
+                account_name = conn_parts.get('AccountName')
+                account_key = conn_parts.get('AccountKey')
+                
+                for result in results:
+                    resume_url = result.get("resume_url")
+                    if resume_url and account_name and account_key:
+                        # Parse blob name from URL
+                        # URL format: https://{account}.blob.core.windows.net/{container}/{blob_path}
+                        try:
+                            url_parts = resume_url.split(f"{account_name}.blob.core.windows.net/")
+                            if len(url_parts) == 2:
+                                path_parts = url_parts[1].split('/', 1)
+                                container_name = path_parts[0]
+                                blob_name = path_parts[1] if len(path_parts) > 1 else ""
+                                
+                                # Generate SAS token (valid for 30 days)
+                                sas_token = generate_blob_sas(
+                                    account_name=account_name,
+                                    container_name=container_name,
+                                    blob_name=blob_name,
+                                    account_key=account_key,
+                                    permission=BlobSasPermissions(read=True),
+                                    expiry=datetime.utcnow() + timedelta(days=30)
+                                )
+                                
+                                # Add SAS token to URL
+                                result["resume_url"] = f"{resume_url}?{sas_token}"
+                        except Exception as e:
+                            print(f"  Could not add SAS token to URL: {str(e)}")
+            
+            except Exception as e:
+                print(f"  Could not generate SAS tokens: {str(e)}")
+            
+            return results
+    
         except Exception as e:
-            raise Exception(f"Failed to retrieve screening results: {str(e)}")
+            print(f"Error getting screening results: {str(e)}")
+            return []
     
     async def get_screening_by_id(
         self,
@@ -1320,9 +1363,15 @@ class CosmosDBService:
     ) -> bool:
         """
         Initialize tracker and detect new batch
-         UPDATED: Detects new batch and sets current_batch_total
+         FIXED: Correctly detects new files vs old files
         """
         try:
+            from azure.storage.blob import BlobServiceClient
+            
+            print(f"\n{'='*60}")
+            print(f" BATCH DETECTION FOR JOB: {job_id}")
+            print(f"{'='*60}")
+            
             # Ensure container exists
             if not hasattr(self, 'screening_jobs_container'):
                 try:
@@ -1335,42 +1384,44 @@ class CosmosDBService:
                         partition_key=PartitionKey(path="/job_id")
                     )
             
+            # Get files currently in blob
+            blob_service_client = BlobServiceClient.from_connection_string(
+                settings.AZURE_STORAGE_CONNECTION_STRING
+            )
+            
+            container_client = blob_service_client.get_container_client(
+                settings.AZURE_STORAGE_CONTAINER_RESUMES
+            )
+            
+            blob_prefix = f"{job_id}/"
+            files_in_blob = set()
+            
+            for blob in container_client.list_blobs(name_starts_with=blob_prefix):
+                if not blob.name.endswith('/'):
+                    filename = blob.name.replace(blob_prefix, "")
+                    files_in_blob.add(filename)
+            
+            print(f" Files in blob storage: {len(files_in_blob)}")
+            for f in list(files_in_blob)[:5]:
+                print(f"   - {f}")
+            
             # Get existing tracker
             screening_job = await self.get_screening_job_by_job_id(job_id)
             
             if not screening_job:
-                # No tracker exists - this is the FIRST file of a NEW batch
-                # Count all files currently in blob to set batch total
-                from azure.storage.blob import BlobServiceClient
+                #  NO TRACKER = FIRST BATCH EVER
+                print(f"\n NO TRACKER - Creating first batch")
+                print(f"   New batch size: {len(files_in_blob)}")
                 
-                blob_service_client = BlobServiceClient.from_connection_string(
-                    settings.AZURE_STORAGE_CONNECTION_STRING
-                )
-                
-                container_client = blob_service_client.get_container_client(
-                    settings.AZURE_STORAGE_CONTAINER_RESUMES
-                )
-                
-                blob_prefix = f"{job_id}/"
-                blob_count = 0
-                
-                for blob in container_client.list_blobs(name_starts_with=blob_prefix):
-                    if not blob.name.endswith('/'):
-                        blob_count += 1
-                
-                print(f"       First file of NEW batch detected!")
-                print(f"       Total files in blob: {blob_count}")
-                print(f"       Locking batch size: {blob_count}")
-                
-                # Create tracker with batch total locked in
                 screening_job_data = {
                     "id": job_id,
                     "job_id": job_id,
                     "user_id": user_id,
-                    "current_batch_total": blob_count,  #  Lock batch size
+                    "current_batch_total": len(files_in_blob),
                     "current_batch_processed": 0,
                     "current_batch_successful": 0,
                     "current_batch_failed": 0,
+                    "current_batch_files": list(files_in_blob),  #  Store filenames
                     "processed_resumes": 0,
                     "successful_resumes": 0,
                     "failed_resumes": 0,
@@ -1383,64 +1434,74 @@ class CosmosDBService:
                 
                 try:
                     self.screening_jobs_container.create_item(body=screening_job_data)
-                    print(f"       Created tracker with batch_total={blob_count}")
+                    print(f"    Created tracker")
                 except exceptions.CosmosResourceExistsError:
-                    print(f"        Tracker created by another message")
-            else:
-                # Tracker exists - check if this is a new batch
-                current_batch_total = screening_job.get("current_batch_total", 0)
-                current_batch_processed = screening_job.get("current_batch_processed", 0)
+                    print(f"    Created by another message")
                 
-                print(f"        Tracker exists:")
-                print(f"         Batch total: {current_batch_total}")
-                print(f"         Batch processed: {current_batch_processed}")
-                
-                # Check if previous batch is completed
-                if current_batch_total > 0 and current_batch_processed >= current_batch_total:
-                    print(f"       Previous batch completed!")
-                    print(f"       Detecting new batch...")
-                    
-                    # Count files in blob
-                    from azure.storage.blob import BlobServiceClient
-                    
-                    blob_service_client = BlobServiceClient.from_connection_string(
-                        settings.AZURE_STORAGE_CONNECTION_STRING
-                    )
-                    
-                    container_client = blob_service_client.get_container_client(
-                        settings.AZURE_STORAGE_CONTAINER_RESUMES
-                    )
-                    
-                    blob_prefix = f"{job_id}/"
-                    blob_count = 0
-                    
-                    for blob in container_client.list_blobs(name_starts_with=blob_prefix):
-                        if not blob.name.endswith('/'):
-                            blob_count += 1
-                    
-                    # If there are MORE files than processed, it's a new batch
-                    if blob_count > current_batch_processed:
-                        new_batch_size = blob_count - current_batch_processed
-                        print(f"       NEW BATCH detected!")
-                        print(f"         Total files in blob: {blob_count}")
-                        print(f"         Previously processed: {current_batch_processed}")
-                        print(f"         New batch size: {new_batch_size}")
-                        
-                        # Reset batch counters for new batch
-                        screening_job["current_batch_total"] = new_batch_size
-                        screening_job["current_batch_processed"] = 0
-                        screening_job["current_batch_successful"] = 0
-                        screening_job["current_batch_failed"] = 0
-                        screening_job["batch_start_time"] = datetime.utcnow().isoformat()
-                        screening_job["updated_at"] = datetime.utcnow().isoformat()
-                        
-                        self.screening_jobs_container.upsert_item(body=screening_job)
-                        print(f"       Reset tracker for new batch")
+                return True
             
+            # Tracker exists - check if new batch needed
+            current_batch_files = set(screening_job.get("current_batch_files", []))
+            current_batch_processed = screening_job.get("current_batch_processed", 0)
+            current_batch_total = screening_job.get("current_batch_total", 0)
+            
+            print(f"\n TRACKER STATUS:")
+            print(f"   Current batch total: {current_batch_total}")
+            print(f"   Current batch processed: {current_batch_processed}")
+            print(f"   Current batch files tracked: {len(current_batch_files)}")
+            
+            #  DETECT NEW FILES
+            new_files = files_in_blob - current_batch_files
+            
+            print(f"\n COMPARISON:")
+            print(f"   Files in blob: {len(files_in_blob)}")
+            print(f"   Files in tracker: {len(current_batch_files)}")
+            print(f"   NEW files detected: {len(new_files)}")
+            
+            if new_files:
+                for f in list(new_files)[:5]:
+                    print(f"      - {f}")
+            
+            # Check if previous batch completed AND new files exist
+            batch_completed = (current_batch_processed >= current_batch_total) and current_batch_total > 0
+            
+            if batch_completed and new_files:
+                #  NEW BATCH DETECTED
+                print(f"\n NEW BATCH DETECTED!")
+                print(f"   Previous batch: {current_batch_total} files (completed)")
+                print(f"   New batch: {len(new_files)} files")
+                
+                # Reset for new batch
+                screening_job["current_batch_total"] = len(new_files)
+                screening_job["current_batch_processed"] = 0
+                screening_job["current_batch_successful"] = 0
+                screening_job["current_batch_failed"] = 0
+                screening_job["current_batch_files"] = list(files_in_blob)  # Update file list
+                screening_job["batch_start_time"] = datetime.utcnow().isoformat()
+                screening_job["updated_at"] = datetime.utcnow().isoformat()
+                
+                self.screening_jobs_container.upsert_item(body=screening_job)
+                print(f"    Reset tracker for new batch")
+            
+            elif not batch_completed and new_files:
+                #  FILES ADDED TO ONGOING BATCH
+                print(f"\n  WARNING: New files added while batch in progress")
+                print(f"   Current batch not complete: {current_batch_processed}/{current_batch_total}")
+                print(f"   Adding {len(new_files)} new files to batch")
+                
+                # Add new files to current batch
+                screening_job["current_batch_total"] = current_batch_total + len(new_files)
+                screening_job["current_batch_files"] = list(files_in_blob)
+                screening_job["updated_at"] = datetime.utcnow().isoformat()
+                
+                self.screening_jobs_container.upsert_item(body=screening_job)
+                print(f"    Updated batch total to {screening_job['current_batch_total']}")
+            
+            print(f"{'='*60}\n")
             return True
         
         except Exception as e:
-            print(f" Error in initialize_or_increment_batch_total: {str(e)}")
+            print(f" Error: {str(e)}")
             import traceback
             traceback.print_exc()
             return True
@@ -1658,3 +1719,73 @@ class CosmosDBService:
                 "all_time_successful": 0,
                 "all_time_failed": 0
             }
+        
+    async def get_candidate_report(
+        self,
+        screening_id: str,
+        job_id: str,
+        user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed candidate report
+         FIXED: Adds SAS token to resume URL
+        """
+        try:
+            # Verify job belongs to user
+            job_data = await self.get_job_description(job_id, user_id)
+            if not job_data:
+                return None
+            
+            # Get screening result
+            if not hasattr(self, 'screenings_container'):
+                return None
+            
+            try:
+                screening = self.screenings_container.read_item(
+                    item=screening_id,
+                    partition_key=job_id
+                )
+                
+                #  Add SAS token to resume URL
+                from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+                from datetime import datetime, timedelta
+                
+                resume_url = screening.get("resume_url")
+                if resume_url:
+                    try:
+                        # Extract connection string parts
+                        conn_parts = dict(item.split('=', 1) for item in settings.AZURE_STORAGE_CONNECTION_STRING.split(';') if '=' in item)
+                        account_name = conn_parts.get('AccountName')
+                        account_key = conn_parts.get('AccountKey')
+                        
+                        if account_name and account_key:
+                            # Parse URL
+                            url_parts = resume_url.split(f"{account_name}.blob.core.windows.net/")
+                            if len(url_parts) == 2:
+                                path_parts = url_parts[1].split('/', 1)
+                                container_name = path_parts[0]
+                                blob_name = path_parts[1] if len(path_parts) > 1 else ""
+                                
+                                # Generate SAS token (30 days)
+                                sas_token = generate_blob_sas(
+                                    account_name=account_name,
+                                    container_name=container_name,
+                                    blob_name=blob_name,
+                                    account_key=account_key,
+                                    permission=BlobSasPermissions(read=True),
+                                    expiry=datetime.utcnow() + timedelta(days=30)
+                                )
+                                
+                                screening["resume_url"] = f"{resume_url}?{sas_token}"
+                    
+                    except Exception as e:
+                        print(f"Could not add SAS token: {str(e)}")
+                
+                return screening
+            
+            except exceptions.CosmosResourceNotFoundError:
+                return None
+        
+        except Exception as e:
+            print(f"Error getting candidate report: {str(e)}")
+            return None

@@ -34,4 +34,5 @@ azure-storage-blob
 azure-eventgrid
 
 msoffcrypto-tool
-olefile
+
+docx2txt

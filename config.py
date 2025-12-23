@@ -4,6 +4,7 @@ Configuration settings for Azure services
 
 from pydantic_settings import BaseSettings
 from typing import Optional
+from pydantic import ConfigDict
 
 
 class Settings(BaseSettings):
@@ -51,9 +52,11 @@ class Settings(BaseSettings):
     SERVICE_BUS_MAX_CONCURRENT_CALLS: int = 5  # Process 5 resumes concurrently
     SERVICE_BUS_MAX_WAIT_TIME: int = 30  # Seconds to wait for messages
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = ConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra='ignore'  # Allow extra fields in .env without errors
+    )
 
 
 settings = Settings()
