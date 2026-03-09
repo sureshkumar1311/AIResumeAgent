@@ -967,37 +967,46 @@ async def get_candidate_report(
     """
     Get candidate screening report (Protected)
     
-    Args:
-        candidate_id: Candidate/Screening ID
-        job_id: Job ID (query parameter)
-        current_user: Authenticated user
-    
     Returns:
-        Complete candidate screening report
+        Complete candidate screening report with fresh SAS token for resume URL
     """
     try:
         # Verify job belongs to user
         job_data = await cosmos_service.get_job_description(job_id, current_user["user_id"])
         if not job_data:
-            raise HTTPException(
-                status_code=404,
-                detail="Job not found or access denied"
-            )
+            raise HTTPException(status_code=404, detail="Job not found or access denied")
         
         result = await cosmos_service.get_screening_by_id(candidate_id, job_id)
         if not result:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Candidate report not found"
-            )
+            raise HTTPException(status_code=404, detail=f"Candidate report not found")
         
-        return result
+        #  FIX: Generate fresh SAS token for resume URL
+        if result.get("resume_url"):
+            try:
+                result["resume_url"] = await blob_service.generate_sas_url(
+                    result["resume_url"],
+                    expiry_hours=24  # 24-hour access
+                )
+            except Exception as e:
+                print(f"Warning: Failed to generate SAS URL for resume: {str(e)}")
+                # Continue without SAS token - URL will be returned as-is
+        
+        # FIX: Also update nested resume_url in screening_details if it exists
+        if result.get("screening_details", {}).get("resume_url"):
+            try:
+                result["screening_details"]["resume_url"] = await blob_service.generate_sas_url(
+                    result["screening_details"]["resume_url"],
+                    expiry_hours=24
+                )
+            except Exception as e:
+                print(f"Warning: Failed to generate SAS URL for screening_details resume: {str(e)}")
+        
+        return result  #  Now returns URL WITH SAS token
     
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 if __name__ == "__main__":
     import uvicorn
