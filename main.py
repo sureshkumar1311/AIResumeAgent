@@ -980,7 +980,7 @@ async def get_candidate_report(
         if not result:
             raise HTTPException(status_code=404, detail=f"Candidate report not found")
         
-        #  FIX: Generate fresh SAS token for resume URL
+        #Generate fresh SAS token for resume URL
         if result.get("resume_url"):
             try:
                 result["resume_url"] = await blob_service.generate_sas_url(
@@ -991,7 +991,7 @@ async def get_candidate_report(
                 print(f"Warning: Failed to generate SAS URL for resume: {str(e)}")
                 # Continue without SAS token - URL will be returned as-is
         
-        # FIX: Also update nested resume_url in screening_details if it exists
+        #Also update nested resume_url in screening_details if it exists
         if result.get("screening_details", {}).get("resume_url"):
             try:
                 result["screening_details"]["resume_url"] = await blob_service.generate_sas_url(
