@@ -595,6 +595,29 @@ async def get_comprehensive_screening_status(
                 detail="Job not found or access denied"
             )
         
+        # Generate SAS tokens for all resume URLs in screening_results
+        if status_data.get("screening_results"):
+            for result in status_data["screening_results"]:
+                # Generate SAS token for top-level resume_url
+                if result.get("resume_url"):
+                    try:
+                        result["resume_url"] = await blob_service.generate_sas_url(
+                            result["resume_url"],
+                            expiry_hours=24
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to generate SAS URL for resume: {str(e)}")
+                
+                # Generate SAS token for nested resume_url in screening_details
+                if result.get("screening_details", {}).get("resume_url"):
+                    try:
+                        result["screening_details"]["resume_url"] = await blob_service.generate_sas_url(
+                            result["screening_details"]["resume_url"],
+                            expiry_hours=24
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to generate SAS URL for screening_details: {str(e)}")
+        
         return status_data
     
     except HTTPException:
