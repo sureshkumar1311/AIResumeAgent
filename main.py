@@ -989,7 +989,7 @@ async def get_candidate_report(
                 )
             except Exception as e:
                 print(f"Warning: Failed to generate SAS URL for resume: {str(e)}")
-                # Continue without SAS token - URL will be returned as-is
+                # Continue without SAS token - URL will be returned 
         
         #Also update nested resume_url in screening_details if it exists
         if result.get("screening_details", {}).get("resume_url"):
