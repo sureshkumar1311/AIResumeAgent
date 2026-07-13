@@ -117,3 +117,4 @@ test_resumes.py
 ./test_resumes
 
 test_resumes/
+pass.py
